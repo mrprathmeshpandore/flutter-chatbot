@@ -1,0 +1,65 @@
+# Flutter & Dart
+build/
+**/build/
+.dart_tool/
+**/.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+*.stamp
+frontend/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*/
+
+# Android / iOS build outputs
+**/android/app/debug
+**/android/app/profile
+**/android/app/release
+**/ios/Flutter/.last_build_id
+**/local.properties
+local.properties
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+backend/venv/
+backend/.venv/
+venv/
+.venv/
+env/
+ENV/
+.pytest_cache/
+**/.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets & Database
+.env
+**/.env
+!.env.example
+*.db
+**/*.db
+*.sqlite
+*.sqlite3
+
+# Uploaded Files
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# IDE & Editors
+.idea/
+**/.idea/
+.vscode/
+**/.vscode/
+*.iml
+**/*.iml
+*.ipr
+*.iws
+
+# Operating System Files
+.DS_Store
+Thumbs.db
