@@ -116,12 +116,35 @@ def explain_topic(
             detail="You do not have access to this PDF document.",
         )
 
+    target_depth = request.depth or "beginner"
+
+    # Check if an explanation already exists for this topic and depth
+    existing_explanation = (
+        db.query(TopicExplanation)
+        .filter(
+            TopicExplanation.pdf_id == pdf.id,
+            TopicExplanation.user_id == current_user.id,
+            TopicExplanation.topic == request.topic,
+            TopicExplanation.depth == target_depth,
+        )
+        .order_by(TopicExplanation.id.desc())
+        .first()
+    )
+    if existing_explanation:
+        return ExplainTopicResponse(
+            topic=existing_explanation.topic,
+            depth=existing_explanation.depth,
+            explanation=existing_explanation.content,
+            pdf_id=pdf.id,
+        )
+
     try:
         explanation_text = AIService.explain_topic(
             pdf=pdf,
             topic=request.topic,
-            depth=request.depth or "beginner",
+            depth=target_depth,
             db=db,
+            user_id=current_user.id,
         )
     except AIServiceError as e:
         raise HTTPException(
@@ -134,7 +157,7 @@ def explain_topic(
         pdf_id=pdf.id,
         user_id=current_user.id,
         topic=request.topic,
-        depth=request.depth or "beginner",
+        depth=target_depth,
         content=explanation_text,
     )
     db.add(explanation_record)

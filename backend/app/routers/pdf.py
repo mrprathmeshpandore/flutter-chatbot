@@ -25,6 +25,7 @@ from app.schemas import (
     PDFPageOut,
 )
 from app.services.auth_service import get_current_user
+from app.services.ai_service import AIService
 from app.services.pdf_service import (
     process_and_save_pdf,
     delete_pdf_document,
@@ -242,6 +243,7 @@ def delete_pdf(
 
     title = pdf.title
 
+    AIService.invalidate_pdf_cache(pdf_id)
     delete_pdf_document(pdf, db)
 
     return {

@@ -22,14 +22,16 @@ async def lifespan(app: FastAPI):
     Runs startup actions (e.g. database table creation) and teardown.
     """
     logger.info("Starting MindVault AI Backend...")
-    try:
-        init_db()
-        logger.info("Database initialized successfully.")
-    except Exception as e:
-        logger.warning(
-            f"Could not connect to database on startup ({e}). "
-            "If using PostgreSQL, ensure it is running and credentials in .env are correct."
-        )
+    import os
+    if os.environ.get("TESTING") != "1":
+        try:
+            init_db()
+            logger.info("Database initialized successfully.")
+        except Exception as e:
+            logger.warning(
+                f"Could not connect to database on startup ({e}). "
+                "If using PostgreSQL, ensure it is running and credentials in .env are correct."
+            )
     yield
     logger.info("Shutting down MindVault AI Backend...")
 

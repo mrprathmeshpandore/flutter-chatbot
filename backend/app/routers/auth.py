@@ -14,6 +14,7 @@ from app.services.auth_service import (
     create_access_token,
     get_current_user,
 )
+from app.services.ai_service import AIService
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,7 @@ def update_me(
 
     if user_in.full_name is not None:
         current_user.full_name = user_in.full_name.strip()
+        AIService.invalidate_user_cache(current_user.id)
 
     if user_in.phone_number is not None:
         current_user.phone_number = user_in.phone_number.strip()

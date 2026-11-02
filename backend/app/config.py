@@ -18,12 +18,17 @@ class Settings(BaseSettings):
     
     # Gemini AI Settings
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-3.5-flash"
+    GEMINI_MODEL: str = "gemini-flash-lite-latest"
     GEMINI_FALLBACK_MODEL: Optional[str] = "gemini-3.5-flash-lite"
     GEMINI_TIMEOUT_SECONDS: float = 12.0
     GEMINI_MAX_RETRIES: int = 2
     GEMINI_INITIAL_RETRY_DELAY: float = 1.0
     GEMINI_MAX_RETRY_DELAY: float = 4.0
+    GEMINI_MAX_CONCURRENT_REQUESTS: int = 4
+
+    # AI Cache Settings
+    AI_CACHE_ENABLED: bool = True
+    AI_CACHE_TTL_SECONDS: int = 86400  # 24 hours
     
     # File Uploads
     MAX_FILE_SIZE_MB: int = 15
@@ -39,7 +44,10 @@ class Settings(BaseSettings):
     CORS_ORIGINS: str = "*"
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+            ".env",
+        ),
         env_file_encoding="utf-8",
         extra="ignore"
     )

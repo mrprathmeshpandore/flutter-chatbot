@@ -1,3 +1,5 @@
+import os
+os.environ["TESTING"] = "1"
 import io
 import pytest
 from typing import Generator
@@ -8,9 +10,10 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
 from app.main import app
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, ai_cache
 from app.services.auth_service import create_access_token
 from app.models import User
+from app.config import settings
 
 # In-memory SQLite engine for fast, isolated tests
 TEST_DATABASE_URL = "sqlite:///:memory:"
@@ -31,6 +34,15 @@ def setup_test_db():
     Base.metadata.drop_all(bind=test_engine)
 
 
+@pytest.fixture(autouse=True)
+def reset_ai_state_for_tests(monkeypatch):
+    """Resets AI cache and fallback model between tests so unit tests are deterministic."""
+    ai_cache.clear()
+    monkeypatch.setattr(settings, "GEMINI_FALLBACK_MODEL", None)
+    yield
+    ai_cache.clear()
+
+
 @pytest.fixture
 def db_session() -> Generator[Session, None, None]:
     """Provides a transactional database session rolled back after each test."""
@@ -48,6 +60,7 @@ def db_session() -> Generator[Session, None, None]:
 @pytest.fixture
 def client(db_session: Session, monkeypatch) -> Generator[TestClient, None, None]:
     """TestClient that uses the test database session."""
+    ai_cache.clear()
     def override_get_db():
         try:
             yield db_session
@@ -59,6 +72,7 @@ def client(db_session: Session, monkeypatch) -> Generator[TestClient, None, None
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+    ai_cache.clear()
 
 
 @pytest.fixture
@@ -149,7 +163,7 @@ def mock_gemini(monkeypatch, request):
     if "disable_mock_gemini" in request.keywords:
         return
 
-    def fake_generate_text(prompt: str, system_instruction: str = None) -> str:
+    def fake_generate_text(prompt: str, system_instruction: str = None, **kwargs) -> str:
         prompt_lower = prompt.lower()
         if "quiz" in prompt_lower or "multiple-choice" in prompt_lower or "examiner" in prompt_lower or "options" in prompt_lower:
             return '''{
@@ -251,7 +265,7 @@ def mock_gemini(monkeypatch, request):
                 "This allows them to recognize complex patterns effectively."
             )
 
-    def fake_generate_text_stream(prompt: str, system_instruction: str = None, timeout_seconds: float = None):
+    def fake_generate_text_stream(prompt: str, system_instruction: str = None, timeout_seconds: float = None, **kwargs):
         full_text = fake_generate_text(prompt, system_instruction)
         chunk_size = 20
         for i in range(0, len(full_text), chunk_size):

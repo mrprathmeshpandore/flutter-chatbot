@@ -10,6 +10,8 @@ logger = logging.getLogger(__name__)
 connect_args = {}
 if settings.DATABASE_URL.startswith("sqlite"):
     connect_args["check_same_thread"] = False
+else:
+    connect_args["connect_timeout"] = 5
 
 # Create SQLAlchemy engine
 # Use pool_pre_ping=True to verify connections before handing them out

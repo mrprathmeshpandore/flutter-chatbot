@@ -1,7 +1,9 @@
+import hashlib
 import json
 import logging
 import random
 import re
+import threading
 import time
 from typing import Optional, List, Dict, Any, Tuple, Generator
 import httpx
@@ -12,6 +14,10 @@ from app.services.pdf_service import search_relevant_pages, search_relevant_chun
 
 logger = logging.getLogger(__name__)
 
+
+# ==============================================================================
+# Exceptions
+# ==============================================================================
 
 class AIServiceError(Exception):
     """Base exception for Gemini AI service errors."""
@@ -28,7 +34,7 @@ class AIServiceError(Exception):
 
 
 class AIServiceUnavailableError(AIServiceError):
-    """Raised when Gemini AI is temporarily unavailable (e.g. 503 high demand, 429 rate limit)."""
+    """Raised when Gemini AI is temporarily unavailable (e.g. 503 high demand, 504 timeout)."""
     def __init__(
         self,
         message: str = "The AI service is temporarily unavailable due to high demand. Please try again later.",
@@ -36,6 +42,21 @@ class AIServiceUnavailableError(AIServiceError):
         original_error: Optional[Exception] = None,
     ):
         super().__init__(message, status_code=status_code, original_error=original_error)
+
+
+class AIServiceRateLimitError(AIServiceError):
+    """Raised when Gemini AI rate limit (RPM) or daily quota (RPD) is reached."""
+    def __init__(
+        self,
+        message: str = "The AI service rate limit has been reached. Please try again in a few moments.",
+        status_code: int = 429,
+        is_daily_exhaustion: bool = False,
+        retry_after_seconds: Optional[int] = None,
+        original_error: Optional[Exception] = None,
+    ):
+        super().__init__(message, status_code=status_code, original_error=original_error)
+        self.is_daily_exhaustion = is_daily_exhaustion
+        self.retry_after_seconds = retry_after_seconds
 
 
 class AIServiceConfigurationError(AIServiceError):
@@ -49,15 +70,72 @@ class AIServiceConfigurationError(AIServiceError):
         super().__init__(message, status_code=status_code, original_error=original_error)
 
 
+# ==============================================================================
+# Helper Functions: Error Parsing & Sanitization
+# ==============================================================================
+
+def sanitize_gemini_error(msg: str) -> str:
+    """Removes API keys and sensitive tokens from error and log messages."""
+    if not msg:
+        return ""
+    if getattr(settings, "GEMINI_API_KEY", None) and settings.GEMINI_API_KEY in msg:
+        msg = msg.replace(settings.GEMINI_API_KEY, "[REDACTED_API_KEY]")
+    msg = re.sub(r"(key=)[A-Za-z0-9_\-\.]{10,}", r"\1[REDACTED]", msg)
+    msg = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-\.]{15,}", r"\1[REDACTED]", msg)
+    return msg
+
+
+def extract_retry_delay_seconds(exc: Exception) -> Optional[float]:
+    """Extracts suggested retryDelay in seconds from Gemini API error message or metadata if present."""
+    exc_str = str(exc)
+    match = re.search(r"retryDelay[\'\":\s]+(\d+(?:\.\d+)?)s?", exc_str, re.IGNORECASE)
+    if match:
+        try:
+            return float(match.group(1))
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def is_daily_quota_exhaustion(exc: Exception, delay_seconds: Optional[float] = None) -> bool:
+    """
+    Distinguishes daily quota exhaustion (RPD) from a transient burst rate limit (RPM).
+    Daily quota errors typically report retryDelay in hours/thousands of seconds
+    or contain phrases like 'free_tier_requests', 'per day', 'requests per day', 'daily'.
+    """
+    if delay_seconds is not None and delay_seconds > 60.0:
+        return True
+    exc_upper = str(exc).upper()
+    indicators = (
+        "PER DAY",
+        "REQUESTS PER DAY",
+        "DAILY",
+        "FREE_TIER_REQUESTS",
+        "GENERATE_CONTENT_FREE_TIER_REQUESTS",
+        "DAY LIMIT",
+    )
+    return any(ind in exc_upper for ind in indicators)
+
+
 def is_transient_gemini_error(exc: Exception) -> Tuple[bool, int, str]:
     """
-    Determines whether a Gemini API error is transient and retryable (e.g. 429, 500, 502, 503, 504).
+    Determines whether a Gemini API error is transient and retryable (e.g. transient 429 RPM, 500, 502, 503, 504).
+    Daily quota exhaustion (RPD) is marked as NOT transient to avoid futile retry loops.
     Returns (is_transient, status_code, reason).
     """
+    delay = extract_retry_delay_seconds(exc)
+    is_daily = is_daily_quota_exhaustion(exc, delay)
+
+    # Fast path for daily quota limits
+    if is_daily:
+        return False, 429, "DAILY_QUOTA_EXHAUSTED"
+
     # 1. Check if the exception has an integer HTTP code (e.g. google.genai.errors.APIError)
     code = getattr(exc, "code", None)
     if isinstance(code, int):
-        if code in (429, 500, 502, 503, 504):
+        if code == 429:
+            return True, 429, "RPM_RATE_LIMIT"
+        if code in (500, 502, 503, 504):
             return True, code, f"HTTP_{code}"
         if code in (400, 401, 403, 404):
             return False, code, f"HTTP_{code}"
@@ -71,9 +149,10 @@ def is_transient_gemini_error(exc: Exception) -> Tuple[bool, int, str]:
     # 3. Check status attribute if present
     status_attr = str(getattr(exc, "status", "")).upper()
     if status_attr in ("UNAVAILABLE", "RESOURCE_EXHAUSTED", "INTERNAL", "DEADLINE_EXCEEDED"):
+        if status_attr == "RESOURCE_EXHAUSTED":
+            return True, 429, "RPM_RATE_LIMIT"
         code_map = {
             "UNAVAILABLE": 503,
-            "RESOURCE_EXHAUSTED": 429,
             "INTERNAL": 500,
             "DEADLINE_EXCEEDED": 504,
         }
@@ -81,12 +160,21 @@ def is_transient_gemini_error(exc: Exception) -> Tuple[bool, int, str]:
 
     # 4. Check string contents
     exc_str = str(exc).upper()
+    if (
+        "429" in exc_str
+        or "RESOURCE_EXHAUSTED" in exc_str
+        or "RESOURCE EXHAUSTED" in exc_str
+        or "TOO MANY REQUESTS" in exc_str
+        or "QUOTA" in exc_str
+        or "RATE LIMIT" in exc_str
+        or "RATELIMIT" in exc_str
+    ):
+        return True, 429, "RPM_RATE_LIMIT"
+
     if "TIMEOUT" in exc_str or "TIMED OUT" in exc_str or "DEADLINE" in exc_str:
         return True, 504, "REQUEST_TIMEOUT"
     if "503" in exc_str or "UNAVAILABLE" in exc_str or "HIGH DEMAND" in exc_str:
         return True, 503, "503_UNAVAILABLE"
-    if "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str or "TOO MANY REQUESTS" in exc_str or "QUOTA" in exc_str:
-        return True, 429, "429_RATE_LIMIT"
     if "500" in exc_str or "INTERNAL SERVER ERROR" in exc_str or "INTERNAL" in exc_str:
         return True, 500, "500_INTERNAL"
     if "502" in exc_str or "BAD GATEWAY" in exc_str:
@@ -105,22 +193,137 @@ def is_transient_gemini_error(exc: Exception) -> Tuple[bool, int, str]:
     return False, 500, "UNKNOWN_ERROR"
 
 
-def sanitize_gemini_error(msg: str) -> str:
-    """Removes API keys and sensitive tokens from error and log messages."""
-    if not msg:
-        return ""
-    if settings.GEMINI_API_KEY and settings.GEMINI_API_KEY in msg:
-        msg = msg.replace(settings.GEMINI_API_KEY, "[REDACTED_API_KEY]")
-    msg = re.sub(r"(key=)[A-Za-z0-9_\-\.]{10,}", r"\1[REDACTED]", msg)
-    msg = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-\.]{15,}", r"\1[REDACTED]", msg)
-    return msg
+# ==============================================================================
+# In-Memory Intelligent Cache with User & Document Isolation
+# ==============================================================================
 
+class AIResponseCache:
+    """
+    Thread-safe, TTL-based LRU response cache for AI outputs.
+    Ensures strict user data isolation by including user_id in composite cache keys.
+    Supports granular invalidation by PDF ID or User ID.
+    """
+    def __init__(self, ttl_seconds: int = 86400, max_items: int = 2000):
+        self.ttl = ttl_seconds
+        self.max_items = max_items
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self.hits = 0
+        self.misses = 0
+
+    def _make_key(self, user_id: int, pdf_id: Optional[int], operation: str, query: str, model: str) -> str:
+        norm_q = query.strip().lower()
+        q_hash = hashlib.sha256(norm_q.encode("utf-8")).hexdigest()[:24]
+        return f"{user_id}:{pdf_id or 0}:{operation}:{q_hash}:{model}"
+
+    def get(self, user_id: int, pdf_id: Optional[int], operation: str, query: str, model: str) -> Optional[Any]:
+        if not getattr(settings, "AI_CACHE_ENABLED", True):
+            return None
+        key = self._make_key(user_id, pdf_id, operation, query, model)
+        now = time.time()
+        with self._lock:
+            entry = self._cache.get(key)
+            if not entry:
+                self.misses += 1
+                return None
+            if now > entry["expires_at"]:
+                del self._cache[key]
+                self.misses += 1
+                return None
+            self.hits += 1
+            return entry["value"]
+
+    def set(self, user_id: int, pdf_id: Optional[int], operation: str, query: str, model: str, value: Any):
+        if not getattr(settings, "AI_CACHE_ENABLED", True):
+            return
+        key = self._make_key(user_id, pdf_id, operation, query, model)
+        now = time.time()
+        with self._lock:
+            if len(self._cache) >= self.max_items:
+                # Evict expired or oldest items
+                expired = [k for k, v in self._cache.items() if now > v["expires_at"]]
+                if expired:
+                    for k in expired:
+                        del self._cache[k]
+                else:
+                    oldest_k = min(self._cache.keys(), key=lambda k: self._cache[k]["expires_at"])
+                    del self._cache[oldest_k]
+
+            self._cache[key] = {
+                "value": value,
+                "expires_at": now + self.ttl,
+                "pdf_id": pdf_id,
+                "user_id": user_id,
+            }
+
+    def invalidate_pdf(self, pdf_id: int) -> int:
+        """Invalidates all cached entries for a given PDF document."""
+        with self._lock:
+            keys_to_del = [k for k, v in self._cache.items() if v.get("pdf_id") == pdf_id]
+            for k in keys_to_del:
+                del self._cache[k]
+            return len(keys_to_del)
+
+    def invalidate_user(self, user_id: int) -> int:
+        """Invalidates all cached entries for a given user."""
+        with self._lock:
+            keys_to_del = [k for k, v in self._cache.items() if v.get("user_id") == user_id]
+            for k in keys_to_del:
+                del self._cache[k]
+            return len(keys_to_del)
+
+    def clear(self):
+        """Clears all cached entries."""
+        with self._lock:
+            self._cache.clear()
+            self.hits = 0
+            self.misses = 0
+
+
+# Global cache instance
+ai_cache = AIResponseCache(
+    ttl_seconds=getattr(settings, "AI_CACHE_TTL_SECONDS", 86400)
+)
+
+# Concurrency limiter to prevent burst RPM spikes
+_concurrency_semaphore = threading.Semaphore(
+    getattr(settings, "GEMINI_MAX_CONCURRENT_REQUESTS", 4)
+)
+
+
+# ==============================================================================
+# Structured Telemetry Logger
+# ==============================================================================
+
+def log_ai_telemetry(
+    operation: str,
+    model: str,
+    latency_ms: float,
+    status_code: int,
+    cached: bool = False,
+    extra: Optional[str] = None,
+):
+    """
+    Structured usage telemetry logger for AI operations.
+    Guarantees no sensitive user data, API keys, or tokens are logged.
+    """
+    extra_str = f" {extra}" if extra else ""
+    logger.info(
+        f"[AI Telemetry] operation={operation} model={model} latency_ms={latency_ms:.1f} "
+        f"status={status_code} cached={cached}{extra_str}"
+    )
+
+
+# ==============================================================================
+# AIService Implementation
+# ==============================================================================
 
 class AIService:
     """
     AI Teacher service powered by Google Gemini API.
     Handles grounded Q&A with PDF context, learning path generation,
-    topic explanations, and quiz question authoring.
+    topic explanations, and quiz question authoring with intelligent caching,
+    strict rate-limit/quota handling, and graceful model fallback.
     """
 
     @classmethod
@@ -131,7 +334,7 @@ class AIService:
         try:
             from google import genai
             from google.genai import types
-            timeout_ms = int(getattr(settings, "GEMINI_TIMEOUT_SECONDS", 10.0) * 1000)
+            timeout_ms = int(getattr(settings, "GEMINI_TIMEOUT_SECONDS", 12.0) * 1000)
             http_options = types.HttpOptions(timeout=timeout_ms)
             return genai.Client(api_key=settings.GEMINI_API_KEY, http_options=http_options)
         except Exception as e:
@@ -141,7 +344,22 @@ class AIService:
     @classmethod
     def _raise_mapped_error(cls, status_code: int, reason: str, original_error: Optional[Exception] = None):
         """Maps HTTP/API status codes to clean, safe, user-facing AIService errors."""
-        if status_code == 504 or "TIMEOUT" in reason.upper():
+        if status_code == 429:
+            if reason == "DAILY_QUOTA_EXHAUSTED":
+                raise AIServiceRateLimitError(
+                    message="The daily AI quota has been reached for today. Please try again tomorrow or upgrade your plan.",
+                    status_code=429,
+                    is_daily_exhaustion=True,
+                    original_error=original_error,
+                )
+            else:
+                raise AIServiceRateLimitError(
+                    message="The AI service rate limit has been exceeded. Please try again in a few moments.",
+                    status_code=429,
+                    is_daily_exhaustion=False,
+                    original_error=original_error,
+                )
+        elif status_code == 504 or "TIMEOUT" in reason.upper():
             raise AIServiceUnavailableError(
                 message="The AI service request timed out while generating content. Please try again later.",
                 status_code=504,
@@ -153,15 +371,9 @@ class AIService:
                 status_code=503,
                 original_error=original_error,
             )
-        elif status_code == 429:
-            raise AIServiceUnavailableError(
-                message="The AI service rate limit has been exceeded. Please try again in a few moments.",
-                status_code=429,
-                original_error=original_error,
-            )
         elif status_code == 404:
             raise AIServiceConfigurationError(
-                message=f"The configured AI model '{settings.GEMINI_MODEL}' is not available or supported. Please check GEMINI_MODEL in .env.",
+                message=f"The configured AI model is not available or supported. Please check GEMINI_MODEL in .env.",
                 status_code=502,
                 original_error=original_error,
             )
@@ -179,15 +391,97 @@ class AIService:
             )
 
     @classmethod
+    def _invoke_generate_single_model(
+        cls,
+        client: Any,
+        model_name: str,
+        full_prompt: str,
+        timeout_ms: int,
+        max_retries: int,
+        initial_delay: float,
+        max_delay: float,
+        backoff_factor: float,
+    ) -> Tuple[Optional[str], Optional[Exception], int, str]:
+        """
+        Attempts to generate content with a specific model, applying bounded retries
+        only for transient errors (never for daily quota exhaustion).
+        Returns (text, last_error, status_code, reason).
+        """
+        last_error: Optional[Exception] = None
+        last_status_code = 503
+        last_reason = "UNAVAILABLE"
+
+        for attempt in range(max_retries + 1):
+            try:
+                try:
+                    from google.genai import types
+                    config = types.GenerateContentConfig(
+                        http_options=types.HttpOptions(timeout=timeout_ms)
+                    )
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=full_prompt,
+                        config=config,
+                    )
+                except (TypeError, AttributeError):
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=full_prompt,
+                    )
+                return response.text or "", None, 200, "OK"
+            except Exception as exc:
+                last_error = exc
+                is_transient, status_code, reason = is_transient_gemini_error(exc)
+                last_status_code = status_code
+                last_reason = reason
+                safe_err = sanitize_gemini_error(str(exc))
+
+                # Immediately stop retries if daily quota is exhausted or error is non-transient
+                if reason == "DAILY_QUOTA_EXHAUSTED":
+                    logger.warning(
+                        f"Daily AI quota exhausted on model '{model_name}': {safe_err}. Halting retries immediately."
+                    )
+                    return None, last_error, last_status_code, last_reason
+
+                if not is_transient:
+                    logger.error(
+                        f"Non-transient Gemini API error ({reason}, code={status_code}) on model '{model_name}': {safe_err}"
+                    )
+                    return None, last_error, last_status_code, last_reason
+
+                if attempt < max_retries:
+                    suggested_delay = extract_retry_delay_seconds(exc)
+                    if suggested_delay is not None and 0.1 <= suggested_delay <= max_delay:
+                        delay = suggested_delay
+                    else:
+                        base_delay = min(max_delay, initial_delay * (backoff_factor ** attempt))
+                        jitter = random.uniform(0.0, base_delay * 0.5)
+                        delay = (base_delay * 0.5) + jitter
+
+                    logger.warning(
+                        f"Gemini API transient error ({reason}, code={status_code}) on model '{model_name}': {safe_err}. "
+                        f"Retrying attempt {attempt + 1}/{max_retries} in {delay:.2f}s..."
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        f"Gemini API retries exhausted ({max_retries} retries) on model '{model_name}'. "
+                        f"Final error ({reason}, code={status_code}): {safe_err}"
+                    )
+
+        return None, last_error, last_status_code, last_reason
+
+    @classmethod
     def generate_text(
         cls,
         prompt: str,
         system_instruction: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
+        operation_name: str = "generate_text",
     ) -> str:
         """
-        Sends a generation request to the Gemini API with a finite timeout, bounded retry,
-        exponential backoff, and jitter for transient 429/500/503/504 errors.
+        Sends a generation request to the Gemini API with concurrency throttling,
+        bounded retry for transient errors, and automatic model fallback.
         """
         if not settings.GEMINI_API_KEY:
             raise AIServiceConfigurationError(
@@ -206,7 +500,7 @@ class AIService:
         if system_instruction:
             full_prompt = f"System Instructions:\n{system_instruction}\n\nUser Request:\n{prompt}"
 
-        effective_timeout = timeout_seconds if timeout_seconds is not None else getattr(settings, "GEMINI_TIMEOUT_SECONDS", 10.0)
+        effective_timeout = timeout_seconds if timeout_seconds is not None else getattr(settings, "GEMINI_TIMEOUT_SECONDS", 12.0)
         timeout_ms = int(max(0.1, effective_timeout) * 1000)
 
         max_retries = max(0, getattr(settings, "GEMINI_MAX_RETRIES", 2))
@@ -214,57 +508,64 @@ class AIService:
         max_delay = max(initial_delay, getattr(settings, "GEMINI_MAX_RETRY_DELAY", 4.0))
         backoff_factor = 2.0
 
-        last_error: Optional[Exception] = None
-        last_status_code = 503
-        last_reason = "UNAVAILABLE"
+        primary_model = getattr(settings, "GEMINI_MODEL", "gemini-flash-lite-latest")
+        fallback_model = getattr(settings, "GEMINI_FALLBACK_MODEL", None)
 
-        for attempt in range(max_retries + 1):
-            try:
-                try:
-                    from google.genai import types
-                    config = types.GenerateContentConfig(
-                        http_options=types.HttpOptions(timeout=timeout_ms)
-                    )
-                    response = client.models.generate_content(
-                        model=settings.GEMINI_MODEL,
-                        contents=full_prompt,
-                        config=config,
-                    )
-                except (TypeError, AttributeError):
-                    response = client.models.generate_content(
-                        model=settings.GEMINI_MODEL,
-                        contents=full_prompt,
-                    )
-                return response.text or ""
-            except Exception as exc:
-                last_error = exc
-                is_transient, status_code, reason = is_transient_gemini_error(exc)
-                last_status_code = status_code
-                last_reason = reason
-                safe_err = sanitize_gemini_error(str(exc))
+        start_time = time.perf_counter()
 
-                if not is_transient:
-                    logger.error(
-                        f"Non-transient Gemini API error ({reason}, code={status_code}): {safe_err}"
-                    )
-                    cls._raise_mapped_error(status_code, reason, exc)
+        with _concurrency_semaphore:
+            # 1. Attempt primary model
+            result_text, last_error, status_code, reason = cls._invoke_generate_single_model(
+                client=client,
+                model_name=primary_model,
+                full_prompt=full_prompt,
+                timeout_ms=timeout_ms,
+                max_retries=max_retries,
+                initial_delay=initial_delay,
+                max_delay=max_delay,
+                backoff_factor=backoff_factor,
+            )
 
-                if attempt < max_retries:
-                    base_delay = min(max_delay, initial_delay * (backoff_factor ** attempt))
-                    jitter = random.uniform(0.0, base_delay * 0.5)
-                    delay = (base_delay * 0.5) + jitter
-                    logger.warning(
-                        f"Gemini API transient error ({reason}, code={status_code}): {safe_err}. "
-                        f"Retrying attempt {attempt + 1}/{max_retries} in {delay:.2f}s..."
-                    )
-                    time.sleep(delay)
-                else:
-                    logger.error(
-                        f"Gemini API retries exhausted ({max_retries} retries). "
-                        f"Final error ({reason}, code={status_code}): {safe_err}"
-                    )
+            if result_text is not None:
+                latency_ms = (time.perf_counter() - start_time) * 1000
+                log_ai_telemetry(operation=operation_name, model=primary_model, latency_ms=latency_ms, status_code=200)
+                return result_text
 
-        cls._raise_mapped_error(last_status_code, last_reason, last_error)
+            # 2. Attempt fallback model if configured, distinct, and failure is potentially model-specific
+            if fallback_model and fallback_model != primary_model and status_code in (404, 429, 500, 502, 503, 504):
+                logger.info(
+                    f"Primary model '{primary_model}' failed ({reason}, code={status_code}). "
+                    f"Attempting fallback to '{fallback_model}'..."
+                )
+                fb_text, fb_error, fb_code, fb_reason = cls._invoke_generate_single_model(
+                    client=client,
+                    model_name=fallback_model,
+                    full_prompt=full_prompt,
+                    timeout_ms=timeout_ms,
+                    max_retries=1,
+                    initial_delay=initial_delay,
+                    max_delay=max_delay,
+                    backoff_factor=backoff_factor,
+                )
+                if fb_text is not None:
+                    latency_ms = (time.perf_counter() - start_time) * 1000
+                    log_ai_telemetry(
+                        operation=operation_name,
+                        model=fallback_model,
+                        latency_ms=latency_ms,
+                        status_code=200,
+                        extra=f"(fallback from {primary_model})",
+                    )
+                    return fb_text
+
+                # If fallback also failed, use its error details if more informative
+                last_error = fb_error or last_error
+                status_code = fb_code
+                reason = fb_reason
+
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        log_ai_telemetry(operation=operation_name, model=primary_model, latency_ms=latency_ms, status_code=status_code)
+        cls._raise_mapped_error(status_code, reason, last_error)
 
     @classmethod
     def generate_text_stream(
@@ -272,10 +573,11 @@ class AIService:
         prompt: str,
         system_instruction: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
+        operation_name: str = "generate_text_stream",
     ) -> Generator[str, None, None]:
         """
         Sends a streaming generation request to the Gemini API with native streaming,
-        yielding incremental text chunks with minimal Time To First Token (TTFT).
+        concurrency control, TTFT optimization, and model fallback.
         """
         if not settings.GEMINI_API_KEY:
             raise AIServiceConfigurationError(
@@ -301,49 +603,64 @@ class AIService:
         )
         timeout_ms = int(max(0.1, effective_timeout) * 1000)
 
+        primary_model = getattr(settings, "GEMINI_MODEL", "gemini-flash-lite-latest")
+        fallback_model = getattr(settings, "GEMINI_FALLBACK_MODEL", None)
+
+        start_time = time.perf_counter()
         response_stream = None
-        try:
-            from google.genai import types
-            config = types.GenerateContentConfig(
-                http_options=types.HttpOptions(timeout=timeout_ms)
-            )
-            response_stream = client.models.generate_content_stream(
-                model=settings.GEMINI_MODEL,
-                contents=full_prompt,
-                config=config,
-            )
-        except (TypeError, AttributeError):
+        active_model = primary_model
+
+        with _concurrency_semaphore:
+            # 1. Attempt primary stream
             try:
+                from google.genai import types
+                config = types.GenerateContentConfig(
+                    http_options=types.HttpOptions(timeout=timeout_ms)
+                )
                 response_stream = client.models.generate_content_stream(
-                    model=settings.GEMINI_MODEL,
+                    model=primary_model,
                     contents=full_prompt,
+                    config=config,
                 )
             except Exception as exc:
                 is_transient, status_code, reason = is_transient_gemini_error(exc)
                 safe_err = sanitize_gemini_error(str(exc))
-                logger.error(
-                    f"Gemini API streaming error ({reason}, code={status_code}): {safe_err}"
-                )
-                cls._raise_mapped_error(status_code, reason, exc)
-        except Exception as exc:
-            is_transient, status_code, reason = is_transient_gemini_error(exc)
-            safe_err = sanitize_gemini_error(str(exc))
-            logger.error(
-                f"Gemini API streaming error ({reason}, code={status_code}): {safe_err}"
-            )
-            cls._raise_mapped_error(status_code, reason, exc)
+                logger.warning(f"Primary streaming failed ({reason}, code={status_code}) on '{primary_model}': {safe_err}")
 
-        if response_stream is not None:
+                # Try fallback model if appropriate
+                if fallback_model and fallback_model != primary_model and status_code in (404, 429, 500, 502, 503, 504):
+                    logger.info(f"Attempting fallback stream with model '{fallback_model}'...")
+                    try:
+                        from google.genai import types
+                        config = types.GenerateContentConfig(
+                            http_options=types.HttpOptions(timeout=timeout_ms)
+                        )
+                        response_stream = client.models.generate_content_stream(
+                            model=fallback_model,
+                            contents=full_prompt,
+                            config=config,
+                        )
+                        active_model = fallback_model
+                    except Exception as fb_exc:
+                        fb_transient, fb_status, fb_reason = is_transient_gemini_error(fb_exc)
+                        cls._raise_mapped_error(fb_status, fb_reason, fb_exc)
+                else:
+                    cls._raise_mapped_error(status_code, reason, exc)
+
+            if response_stream is None:
+                cls._raise_mapped_error(503, "UNAVAILABLE", None)
+
+            # 2. Yield chunks from active stream
             try:
                 for chunk in response_stream:
                     if chunk.text:
                         yield chunk.text
+                latency_ms = (time.perf_counter() - start_time) * 1000
+                log_ai_telemetry(operation=operation_name, model=active_model, latency_ms=latency_ms, status_code=200)
             except Exception as exc:
+                latency_ms = (time.perf_counter() - start_time) * 1000
                 is_transient, status_code, reason = is_transient_gemini_error(exc)
-                safe_err = sanitize_gemini_error(str(exc))
-                logger.error(
-                    f"Gemini API streaming chunk iteration error ({reason}, code={status_code}): {safe_err}"
-                )
+                log_ai_telemetry(operation=operation_name, model=active_model, latency_ms=latency_ms, status_code=status_code)
                 cls._raise_mapped_error(status_code, reason, exc)
 
     @classmethod
@@ -456,10 +773,34 @@ class AIService:
         db: Session,
         history: Optional[List[Dict[str, str]]] = None,
         user_name: Optional[str] = None,
+        user_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        Non-streaming personal AI teacher response strictly grounded in document context.
+        Non-streaming personal AI teacher response strictly grounded in document context
+        with intelligent response caching.
         """
+        model_name = getattr(settings, "GEMINI_MODEL", "gemini-flash-lite-latest")
+        effective_user_id = user_id or (pdf.owner_id if pdf else 0)
+
+        # Check response cache when no conversation history is passed
+        if not history:
+            cached = ai_cache.get(
+                user_id=effective_user_id,
+                pdf_id=pdf.id if pdf else None,
+                operation="ask_ai",
+                query=question,
+                model=model_name,
+            )
+            if cached is not None:
+                log_ai_telemetry(
+                    operation="ask_ai",
+                    model=model_name,
+                    latency_ms=0.5,
+                    status_code=200,
+                    cached=True,
+                )
+                return cached
+
         full_prompt, system_instruction, source_pages, has_relevant_content = (
             cls._build_ai_teacher_prompt(
                 question=question,
@@ -477,12 +818,22 @@ class AIService:
                 pdf.id,
                 question[:50],
             )
-            return {
+            negative_result = {
                 "answer": "I could not find this information in your uploaded document.",
                 "source_pages": [],
                 "used_pdf": True,
                 "pdf_id": pdf.id,
             }
+            if not history:
+                ai_cache.set(
+                    user_id=effective_user_id,
+                    pdf_id=pdf.id,
+                    operation="ask_ai",
+                    query=question,
+                    model=model_name,
+                    value=negative_result,
+                )
+            return negative_result
 
         # Generate AI answer
         raw_answer = cls.generate_text(
@@ -505,12 +856,25 @@ class AIService:
         if "could not find" in raw_answer.lower() and "document" in raw_answer.lower():
             cited_pages = []
 
-        return {
+        result = {
             "answer": raw_answer,
             "source_pages": sorted(cited_pages) if pdf else [],
             "used_pdf": bool(pdf),
             "pdf_id": pdf.id if pdf else None,
         }
+
+        # Cache result if stateless question
+        if not history:
+            ai_cache.set(
+                user_id=effective_user_id,
+                pdf_id=pdf.id if pdf else None,
+                operation="ask_ai",
+                query=question,
+                model=model_name,
+                value=result,
+            )
+
+        return result
 
     @classmethod
     def ask_ai_teacher_stream(
@@ -520,11 +884,51 @@ class AIService:
         db: Session,
         history: Optional[List[Dict[str, str]]] = None,
         user_name: Optional[str] = None,
+        user_id: Optional[int] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """
         Streaming personal AI teacher generator yielding initial metadata,
-        real-time tokens, and final citation verification.
+        real-time tokens, and final citation verification with cache hit support.
         """
+        model_name = getattr(settings, "GEMINI_MODEL", "gemini-flash-lite-latest")
+        effective_user_id = user_id or (pdf.owner_id if pdf else 0)
+
+        # Check response cache when no conversation history is passed
+        if not history:
+            cached = ai_cache.get(
+                user_id=effective_user_id,
+                pdf_id=pdf.id if pdf else None,
+                operation="ask_ai",
+                query=question,
+                model=model_name,
+            )
+            if cached is not None:
+                log_ai_telemetry(
+                    operation="ask_ai_stream",
+                    model=model_name,
+                    latency_ms=1.0,
+                    status_code=200,
+                    cached=True,
+                )
+                yield {
+                    "type": "metadata",
+                    "used_pdf": cached.get("used_pdf", False),
+                    "pdf_id": cached.get("pdf_id"),
+                    "source_pages": cached.get("source_pages", []),
+                }
+                yield {
+                    "type": "token",
+                    "text": cached["answer"],
+                }
+                yield {
+                    "type": "done",
+                    "source_pages": cached.get("source_pages", []),
+                    "used_pdf": cached.get("used_pdf", False),
+                    "pdf_id": cached.get("pdf_id"),
+                    "full_answer": cached["answer"],
+                }
+                return
+
         full_prompt, system_instruction, source_pages, has_relevant_content = (
             cls._build_ai_teacher_prompt(
                 question=question,
@@ -595,6 +999,24 @@ class AIService:
         if "could not find" in full_answer.lower() and "document" in full_answer.lower():
             cited_pages = []
 
+        result_dict = {
+            "answer": full_answer,
+            "source_pages": sorted(cited_pages) if pdf else [],
+            "used_pdf": bool(pdf),
+            "pdf_id": pdf.id if pdf else None,
+        }
+
+        # Cache completed stream result
+        if not history:
+            ai_cache.set(
+                user_id=effective_user_id,
+                pdf_id=pdf.id if pdf else None,
+                operation="ask_ai",
+                query=question,
+                model=model_name,
+                value=result_dict,
+            )
+
         # 4. Yield completion event
         yield {
             "type": "done",
@@ -609,6 +1031,17 @@ class AIService:
         """
         Analyzes the PDF document content and generates a structured learning roadmap.
         """
+        model_name = getattr(settings, "GEMINI_MODEL", "gemini-flash-lite-latest")
+        cached = ai_cache.get(
+            user_id=pdf.owner_id,
+            pdf_id=pdf.id,
+            operation="learning_path",
+            query=f"lp:{pdf.id}",
+            model=model_name,
+        )
+        if cached is not None:
+            return cached
+
         # Collect sample text from first 8 pages
         pages = db.query(PDFPage).filter(PDFPage.pdf_id == pdf.id).order_by(PDFPage.page_number).limit(8).all()
         extracted_content = "\n\n".join([f"Page {p.page_number}: {p.text_content[:800]}" for p in pages])
@@ -638,7 +1071,7 @@ Return ONLY a valid JSON object with the following exact structure (no other mar
 Provide between 3 and 7 coherent topics covering the material sequentially.
 """
         response_text = cls.generate_text(prompt)
-        
+
         # Parse JSON
         parsed_data = cls._extract_json(response_text)
         if (
@@ -648,6 +1081,14 @@ Provide between 3 and 7 coherent topics covering the material sequentially.
             and isinstance(parsed_data["topics"], list)
             and len(parsed_data["topics"]) > 0
         ):
+            ai_cache.set(
+                user_id=pdf.owner_id,
+                pdf_id=pdf.id,
+                operation="learning_path",
+                query=f"lp:{pdf.id}",
+                model=model_name,
+                value=parsed_data,
+            )
             return parsed_data
 
         logger.error(
@@ -659,10 +1100,24 @@ Provide between 3 and 7 coherent topics covering the material sequentially.
         )
 
     @classmethod
-    def explain_topic(cls, pdf: PDFDocument, topic: str, depth: str, db: Session) -> str:
+    def explain_topic(cls, pdf: PDFDocument, topic: str, depth: str, db: Session, user_id: Optional[int] = None) -> str:
         """
-        Explains a specific topic from the PDF at the chosen depth (beginner, intermediate, advanced).
+        Explains a specific topic from the PDF at the chosen depth (beginner, intermediate, advanced)
+        with intelligent caching.
         """
+        effective_user_id = user_id or pdf.owner_id
+        model_name = getattr(settings, "GEMINI_MODEL", "gemini-flash-lite-latest")
+
+        cached = ai_cache.get(
+            user_id=effective_user_id,
+            pdf_id=pdf.id,
+            operation="explain_topic",
+            query=f"{topic}:{depth}",
+            model=model_name,
+        )
+        if cached is not None:
+            return cached
+
         relevant_pages = search_relevant_pages(pdf.id, topic, db, max_pages=3)
         context = "\n".join([f"[Page {p['page_number']}]: {p['text']}" for p in relevant_pages])
 
@@ -681,20 +1136,28 @@ Provide a well-structured explanation including:
 3. Real-world Example or Analogy
 4. Source references (cite [Page X] when referencing context)
 """
-        return cls.generate_text(prompt)
+        explanation = cls.generate_text(prompt)
+
+        ai_cache.set(
+            user_id=effective_user_id,
+            pdf_id=pdf.id,
+            operation="explain_topic",
+            query=f"{topic}:{depth}",
+            model=model_name,
+            value=explanation,
+        )
+        return explanation
 
     @classmethod
     def _extract_json(cls, text: str) -> Optional[Dict[str, Any]]:
         """Extracts and parses JSON from response text even if wrapped in markdown codeblocks."""
-        # Try finding json in ```json ... ```
         match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
         if match:
             try:
                 return json.loads(match.group(1))
             except json.JSONDecodeError:
                 pass
-        
-        # Try parsing the whole text or between first { and last }
+
         first_brace = text.find("{")
         last_brace = text.rfind("}")
         if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
@@ -704,3 +1167,16 @@ Provide a well-structured explanation including:
                 pass
 
         return None
+
+    # Cache Management Helpers
+    @classmethod
+    def invalidate_pdf_cache(cls, pdf_id: int) -> int:
+        return ai_cache.invalidate_pdf(pdf_id)
+
+    @classmethod
+    def invalidate_user_cache(cls, user_id: int) -> int:
+        return ai_cache.invalidate_user(user_id)
+
+    @classmethod
+    def clear_cache(cls):
+        ai_cache.clear()

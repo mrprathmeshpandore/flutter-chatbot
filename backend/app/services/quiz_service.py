@@ -36,12 +36,40 @@ class QuizService:
         num_questions: int,
         difficulty: str,
         db: Session,
+        force_refresh: bool = False,
     ) -> Quiz:
 
         source_context = ""
         pdf = None
 
         quiz_title = f"{topic or 'General Knowledge'} Quiz"
+
+        # Check if an unattempted quiz with enough questions already exists for this pdf and difficulty
+        if pdf_id and not force_refresh:
+            existing_quiz = (
+                db.query(Quiz)
+                .filter(
+                    Quiz.pdf_id == pdf_id,
+                    Quiz.user_id == user.id,
+                    Quiz.difficulty == difficulty,
+                )
+                .order_by(Quiz.id.desc())
+                .first()
+            )
+            if existing_quiz and len(existing_quiz.questions) >= num_questions:
+                has_submission = (
+                    db.query(QuizSubmission.id)
+                    .filter(QuizSubmission.quiz_id == existing_quiz.id)
+                    .first()
+                )
+                if not has_submission:
+                    logger.info(
+                        "Reusing existing unattempted quiz id=%s for user=%s, pdf=%s",
+                        existing_quiz.id,
+                        user.id,
+                        pdf_id,
+                    )
+                    return existing_quiz
 
         # 1. Get PDF Details
         if pdf_id:

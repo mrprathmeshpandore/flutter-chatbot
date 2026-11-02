@@ -51,6 +51,7 @@ def ask_ai(
             db=db,
             history=history_dicts,
             user_name=current_user.full_name,
+            user_id=current_user.id,
         )
     except AIServiceError as e:
         raise HTTPException(
@@ -123,6 +124,7 @@ def ask_ai_stream(
                 db=db,
                 history=history_dicts,
                 user_name=user_name,
+                user_id=user_id,
             )
             for event in stream_gen:
                 yield f"data: {json.dumps(event)}\n\n"
