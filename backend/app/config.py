@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE_MB: int = 15
     UPLOAD_DIR: str = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "uploads")
     
+    # RAG Retrieval Settings
+    RAG_CHUNK_SIZE: int = 800
+    RAG_CHUNK_OVERLAP: int = 150
+    RAG_MAX_CHUNKS: int = 5
+    RAG_MIN_SIMILARITY: float = 0.15
+
     # CORS Configuration
     CORS_ORIGINS: str = "*"
 

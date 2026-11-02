@@ -1,16 +1,32 @@
+
 import json
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
+
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
-from app.models import Quiz, QuizQuestion, QuizSubmission, ProgressLog, PDFDocument, PDFPage, User
-from app.schemas import QuizAnswerItem, QuizResultOut, SubmittedAnswerDetail
+
+from app.models import (
+    Quiz,
+    QuizQuestion,
+    QuizSubmission,
+    ProgressLog,
+    PDFDocument,
+    PDFPage,
+    User,
+)
+from app.schemas import (
+    QuizAnswerItem,
+    QuizResultOut,
+    SubmittedAnswerDetail,
+)
 from app.services.ai_service import AIService
 
 logger = logging.getLogger(__name__)
 
 
 class QuizService:
+
     @classmethod
     def generate_quiz(
         cls,
@@ -21,113 +37,233 @@ class QuizService:
         difficulty: str,
         db: Session,
     ) -> Quiz:
-        """
-        Generates a customized multiple-choice quiz using Gemini AI based on
-        either a PDF's content or a specified topic.
-        """
+
         source_context = ""
+        pdf = None
+
         quiz_title = f"{topic or 'General Knowledge'} Quiz"
 
+        # 1. Get PDF Details
         if pdf_id:
-            pdf = db.query(PDFDocument).filter(PDFDocument.id == pdf_id, PDFDocument.owner_id == user.id).first()
+            pdf = (
+                db.query(PDFDocument)
+                .filter(
+                    PDFDocument.id == pdf_id,
+                    PDFDocument.owner_id == user.id,
+                )
+                .first()
+            )
+
             if not pdf:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Specified PDF document not found or does not belong to you.",
+                    detail="PDF document not found.",
                 )
+
             quiz_title = f"{pdf.title} Quiz"
-            # Gather content from PDF pages
-            pages = db.query(PDFPage).filter(PDFPage.pdf_id == pdf.id).order_by(PDFPage.page_number).limit(10).all()
-            source_context = "\n\n".join([f"Page {p.page_number}: {p.text_content[:600]}" for p in pages])
 
+            pages = (
+                db.query(PDFPage)
+                .filter(PDFPage.pdf_id == pdf.id)
+                .order_by(PDFPage.page_number)
+                .limit(10)
+                .all()
+            )
+
+            source_context = "\n\n".join(
+                [
+                    f"Page {p.page_number}: {p.text_content[:600]}"
+                    for p in pages
+                ]
+            )
+
+        # 2. Get Previously Generated Questions
+        previous_questions = []
+
+        if pdf_id:
+            previous_questions = [
+                row[0]
+                for row in (
+                    db.query(QuizQuestion.question_text)
+                    .join(Quiz, QuizQuestion.quiz_id == Quiz.id)
+                    .filter(
+                        Quiz.pdf_id == pdf_id,
+                        Quiz.user_id == user.id,
+                    )
+                    .all()
+                )
+            ]
+
+        previous_questions_text = "\n".join(
+            f"- {question}"
+            for question in previous_questions
+        )
+
+        # 3. Prepare AI Prompt
         prompt = f"""
-You are an expert educational examiner. Create a {num_questions}-question multiple-choice quiz.
+You are an expert educational examiner.
 
-TOPIC: {topic or (pdf.title if pdf_id else 'General Science and Math')}
-DIFFICULTY LEVEL: {difficulty}
+Create exactly {num_questions} multiple-choice questions.
+
+TOPIC: {topic or (pdf.title if pdf else 'General Science and Math')}
+
+DIFFICULTY: {difficulty}
+
 SOURCE CONTENT:
-{source_context[:3500] if source_context else "Generate balanced, insightful educational questions on this topic."}
+{source_context[:3500] if source_context else "Generate educational questions on this topic."}
 
-Return ONLY valid JSON (no surrounding markdown or chat) with this schema:
+PREVIOUSLY GENERATED QUESTIONS:
+{previous_questions_text or "No previous questions."}
+
+IMPORTANT RULES:
+- Never repeat previously generated questions.
+- Do not rephrase old questions with minor word changes.
+- Test different concepts, facts, and applications.
+- Generate exactly {num_questions} unique questions.
+- Every question must have exactly 4 options.
+- correct_option must be an integer between 0 and 3.
+
+Return ONLY valid JSON in this format:
+
 {{
-  "title": "{quiz_title}",
-  "questions": [
-    {{
-      "question_text": "What is the primary function of...?",
-      "options": ["Option A", "Option B", "Option C", "Option D"],
-      "correct_option": 0,
-      "explanation": "Brief explanation of why Option A is correct."
-    }}
-  ]
+    "title": "{quiz_title}",
+    "questions": [
+        {{
+            "question_text": "Question here?",
+            "options": ["Option A", "Option B", "Option C", "Option D"],
+            "correct_option": 0,
+            "explanation": "Explanation here."
+        }}
+    ]
 }}
-Ensure 'correct_option' is an integer between 0 and 3 matching the index of the correct answer in the options list. Provide exactly {num_questions} questions.
 """
-        generated_json = None
+
+        # 4. Generate Questions Using AI
         try:
             response_text = AIService.generate_text(prompt)
             generated_json = AIService._extract_json(response_text)
-        except Exception as e:
-            logger.warning(f"AI quiz generation failed, falling back to structured template: {e}")
 
-        # Validate or fallback
+        except Exception:
+            logger.exception("AI quiz generation failed.")
+
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI could not generate the quiz. Please try again.",
+            )
+
+        # 5. Validate AI Response
         questions_data = []
-        if generated_json and "questions" in generated_json and len(generated_json["questions"]) > 0:
-            for q in generated_json["questions"][:num_questions]:
-                opts = q.get("options", [])
-                if len(opts) >= 2:
-                    # Pad to 4 options if needed
-                    while len(opts) < 4:
-                        opts.append(f"Option {len(opts) + 1}")
-                    correct_idx = q.get("correct_option", 0)
-                    if not isinstance(correct_idx, int) or correct_idx < 0 or correct_idx >= len(opts):
-                        correct_idx = 0
-                    questions_data.append({
-                        "question_text": q.get("question_text", "Sample Question"),
-                        "options": opts[:4],
-                        "correct_option": correct_idx,
-                        "explanation": q.get("explanation", "Correct based on the material."),
-                    })
 
-        # Fallback if no questions parsed
-        if not questions_data:
-            base_topic = topic or (pdf.title if pdf_id else "Core Concepts")
-            for i in range(1, num_questions + 1):
-                questions_data.append({
-                    "question_text": f"Question {i}: Which of the following best describes a key principle of {base_topic}?",
-                    "options": [
-                        f"Fundamental component {i} of the subject",
-                        "An unrelated historical principle",
-                        "A disproven hypothesis",
-                        "None of the above",
-                    ],
-                    "correct_option": 0,
-                    "explanation": f"Option 1 accurately reflects the core principle of {base_topic}.",
-                })
+        if not isinstance(generated_json, dict):
+            generated_json = {}
 
-        # Save to DB
+        generated_questions = generated_json.get("questions", [])
+
+        if not isinstance(generated_questions, list):
+            generated_questions = []
+
+        seen_questions = {
+            question.strip().lower()
+            for question in previous_questions
+        }
+
+        for q in generated_questions:
+
+            if len(questions_data) >= num_questions:
+                break
+
+            if not isinstance(q, dict):
+                continue
+
+            question_text = q.get("question_text", "")
+            options = q.get("options", [])
+            correct_option = q.get("correct_option", 0)
+
+            if not isinstance(question_text, str):
+                continue
+
+            question_text = question_text.strip()
+
+            if not question_text:
+                continue
+
+            normalized_question = question_text.lower()
+
+            # Avoid duplicate questions
+            if normalized_question in seen_questions:
+                continue
+
+            if normalized_question in {
+                item["question_text"].lower()
+                for item in questions_data
+            }:
+                continue
+
+            if not isinstance(options, list) or len(options) != 4:
+                continue
+
+            if not all(isinstance(option, str) for option in options):
+                continue
+
+            if (
+                not isinstance(correct_option, int)
+                or isinstance(correct_option, bool)
+                or correct_option < 0
+                or correct_option > 3
+            ):
+                continue
+
+            seen_questions.add(normalized_question)
+
+            questions_data.append({
+                "question_text": question_text,
+                "options": options,
+                "correct_option": correct_option,
+                "explanation": q.get("explanation", ""),
+            })
+
+        # 6. Do Not Save Fake Or Incomplete Questions
+        if len(questions_data) != num_questions:
+
+            logger.warning(
+                "Quiz generation incomplete. Expected %s questions, got %s.",
+                num_questions,
+                len(questions_data),
+            )
+
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Could not generate enough unique questions. Please try again.",
+            )
+
+        # 7. Save Quiz In Database
         quiz = Quiz(
             user_id=user.id,
             pdf_id=pdf_id,
             title=quiz_title,
-            topic=topic or (pdf.title if pdf_id else "General"),
+            topic=topic or (pdf.title if pdf else "General"),
             difficulty=difficulty,
             total_questions=len(questions_data),
         )
+
         db.add(quiz)
         db.flush()
 
         for q_data in questions_data:
-            quiz_q = QuizQuestion(
+
+            quiz_question = QuizQuestion(
                 quiz_id=quiz.id,
                 question_text=q_data["question_text"],
                 options=q_data["options"],
                 correct_option=q_data["correct_option"],
-                explanation=q_data.get("explanation"),
+                explanation=q_data["explanation"],
             )
-            db.add(quiz_q)
+
+            db.add(quiz_question)
 
         db.commit()
         db.refresh(quiz)
+
         return quiz
 
     @classmethod
@@ -138,25 +274,32 @@ Ensure 'correct_option' is an integer between 0 and 3 matching the index of the 
         answers: List[QuizAnswerItem],
         db: Session,
     ) -> QuizResultOut:
-        """
-        Evaluates submitted answers, scores the quiz, creates a submission record,
-        and logs the student's progress.
-        """
-        quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+
+        quiz = (
+            db.query(Quiz)
+            .filter(Quiz.id == quiz_id)
+            .first()
+        )
+
         if not quiz:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Quiz with ID {quiz_id} not found.",
+                detail="Quiz not found.",
             )
 
-        # Enforce user ownership of the quiz
         if quiz.user_id != user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You do not have access to this quiz.",
             )
 
-        questions = db.query(QuizQuestion).filter(QuizQuestion.quiz_id == quiz.id).order_by(QuizQuestion.id).all()
+        questions = (
+            db.query(QuizQuestion)
+            .filter(QuizQuestion.quiz_id == quiz.id)
+            .order_by(QuizQuestion.id)
+            .all()
+        )
+
         if not questions:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -164,40 +307,64 @@ Ensure 'correct_option' is an integer between 0 and 3 matching the index of the 
             )
 
         question_map = {q.id: q for q in questions}
-        answer_map = {a.question_id: a.selected_option for a in answers}
+
+        answer_map = {}
+
+        for answer in answers:
+
+            if answer.question_id not in question_map:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid question ID in submitted answers.",
+                )
+
+            if answer.question_id in answer_map:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Duplicate answer submitted for a question.",
+                )
+
+            answer_map[answer.question_id] = answer.selected_option
 
         correct_count = 0
-        details: List[SubmittedAnswerDetail] = []
+        details = []
         submission_json = []
 
-        for q in questions:
-            selected = answer_map.get(q.id, -1)  # -1 if unanswered
-            is_correct = (selected == q.correct_option)
+        for question in questions:
+
+            selected = answer_map.get(question.id, -1)
+
+            is_correct = selected == question.correct_option
+
             if is_correct:
                 correct_count += 1
 
-            detail = SubmittedAnswerDetail(
-                question_id=q.id,
-                question_text=q.question_text,
-                options=q.options,
-                selected_option=selected,
-                correct_option=q.correct_option,
-                is_correct=is_correct,
-                explanation=q.explanation,
+            details.append(
+                SubmittedAnswerDetail(
+                    question_id=question.id,
+                    question_text=question.question_text,
+                    options=question.options,
+                    selected_option=selected,
+                    correct_option=question.correct_option,
+                    is_correct=is_correct,
+                    explanation=question.explanation,
+                )
             )
-            details.append(detail)
 
             submission_json.append({
-                "question_id": q.id,
+                "question_id": question.id,
                 "selected_option": selected,
-                "correct_option": q.correct_option,
+                "correct_option": question.correct_option,
                 "is_correct": is_correct,
             })
 
         total = len(questions)
-        percentage = round((correct_count / total) * 100.0, 1)
 
-        # Record submission
+        percentage = round(
+            (correct_count / total) * 100.0,
+            1,
+        )
+
         submission = QuizSubmission(
             quiz_id=quiz.id,
             user_id=user.id,
@@ -207,16 +374,22 @@ Ensure 'correct_option' is an integer between 0 and 3 matching the index of the 
             percentage=percentage,
             submitted_answers=submission_json,
         )
+
         db.add(submission)
 
-        # Record progress log
         log = ProgressLog(
             user_id=user.id,
+            pdf_id=quiz.pdf_id,
             activity_type="quiz_completed",
             subject=quiz.topic or quiz.title,
             score=percentage,
-            metadata_json={"quiz_id": quiz.id, "submission_id": None},
+            metadata_json={
+                "quiz_id": quiz.id,
+                "pdf_id": quiz.pdf_id,
+                "submission_id": None,
+            },
         )
+
         db.add(log)
 
         db.commit()
@@ -241,14 +414,17 @@ Ensure 'correct_option' is an integer between 0 and 3 matching the index of the 
         quiz_id: int,
         db: Session,
     ) -> List[QuizSubmission]:
-        """
-        Retrieves all past submissions for a specific quiz.
-        """
-        quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+
+        quiz = (
+            db.query(Quiz)
+            .filter(Quiz.id == quiz_id)
+            .first()
+        )
+
         if not quiz:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Quiz with ID {quiz_id} not found.",
+                detail="Quiz not found.",
             )
 
         if quiz.user_id != user.id:
@@ -257,7 +433,12 @@ Ensure 'correct_option' is an integer between 0 and 3 matching the index of the 
                 detail="You do not have access to this quiz's results.",
             )
 
-        return db.query(QuizSubmission).filter(
-            QuizSubmission.quiz_id == quiz_id,
-            QuizSubmission.user_id == user.id,
-        ).order_by(QuizSubmission.submitted_at.desc()).all()
+        return (
+            db.query(QuizSubmission)
+            .filter(
+                QuizSubmission.quiz_id == quiz_id,
+                QuizSubmission.user_id == user.id,
+            )
+            .order_by(QuizSubmission.submitted_at.desc())
+            .all()
+        )

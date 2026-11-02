@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import List, Optional, Any
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, ConfigDict
 
 
 # ==========================================
@@ -22,11 +22,18 @@ class UserOut(BaseModel):
     id: int
     email: str
     full_name: Optional[str] = None
+    phone_number: Optional[str] = None
+    profile_image: Optional[str] = None
     is_active: bool
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = Field(None, max_length=255)
+    email: Optional[EmailStr] = None
+    phone_number: Optional[str] = Field(None, max_length=50)
 
 
 class Token(BaseModel):
@@ -49,8 +56,7 @@ class PDFPageOut(BaseModel):
     page_number: int
     text_content: str
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PDFDocumentOut(BaseModel):
@@ -62,8 +68,7 @@ class PDFDocumentOut(BaseModel):
     uploaded_at: datetime
     owner_id: int
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PDFDocumentDetail(PDFDocumentOut):
@@ -92,8 +97,7 @@ class LearningPathOut(BaseModel):
     topics: List[LearningTopic]
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ExplainTopicRequest(BaseModel):
@@ -146,8 +150,7 @@ class QuizQuestionOut(BaseModel):
     question_text: str
     options: List[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class QuizQuestionWithAnswerOut(QuizQuestionOut):
@@ -165,8 +168,7 @@ class QuizOut(BaseModel):
     questions: List[QuizQuestionOut]
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class QuizAnswerItem(BaseModel):
@@ -210,8 +212,7 @@ class QuizHistoryItem(BaseModel):
     percentage: float
     submitted_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ==========================================

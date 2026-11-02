@@ -76,6 +76,7 @@ def get_learning_path(
     # Record progress log
     log = ProgressLog(
         user_id=current_user.id,
+        pdf_id=pdf.id,
         activity_type="learning_path_generated",
         subject=pdf.title,
         metadata_json={"pdf_id": pdf.id, "topics_count": len(topics_list)},
@@ -141,8 +142,10 @@ def explain_topic(
     # Log progress
     log = ProgressLog(
         user_id=current_user.id,
+        pdf_id=pdf.id,
         activity_type="topic_explained",
         subject=f"{pdf.title}: {request.topic}",
+        metadata_json={"pdf_id": pdf.id, "topic": request.topic},
     )
     db.add(log)
 

@@ -63,3 +63,9 @@ backend/uploads/*
 # Operating System Files
 .DS_Store
 Thumbs.db
+
+# Archives and Temporary Backups
+*.zip
+*.tar.gz
+backend/progress_logs_backup_before_phase1.json
+

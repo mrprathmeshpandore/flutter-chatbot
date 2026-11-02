@@ -1,7 +1,10 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:mind_ai/const/app_colors.dart';
 import 'package:mind_ai/const/custom_background.dart';
 import 'package:mind_ai/const/custom_button_widget.dart';
+import 'package:mind_ai/repo/auth_repo.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -34,7 +37,6 @@ class _LoginScreenState extends State<LoginScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  
                   Row(
                     children: [
                       Container(
@@ -176,19 +178,56 @@ class _LoginScreenState extends State<LoginScreen> {
                     width: double.infinity,
                     child: CustomButton(
                       title: 'Sign in  →',
-                      onPressed: () {
-                        if (emailController.text.trim().isEmpty ||
-                            passwordController.text.isEmpty) {
+
+                      onPressed: () async {
+                        final email = emailController.text.trim();
+                        final password = passwordController.text;
+
+                        if (email.isEmpty || password.isEmpty) {
                           ScaffoldMessenger.of(context).showSnackBar(
                             const SnackBar(
                               content: Text('Please enter email and password'),
                             ),
                           );
-                        } else {
+                          return;
+                        }
+
+                        try {
+                          final result = await AuthRepo().login(
+                            email: email,
+                            password: password,
+                          );
+
+                          if (!context.mounted) return;
+
+                          final token = result['access_token'];
+
+                          if (token == null) {
+                            throw Exception('Login token not received');
+                          }
+
+                          if (result['user'] != null) {
+                            try {
+                              final prefs = await SharedPreferences.getInstance();
+                              await prefs.setString(
+                                'mindvault_cached_user_profile',
+                                jsonEncode(result['user']),
+                              );
+                            } catch (_) {}
+                          }
+
+                          if (!context.mounted) return;
+
+                          Navigator.pushReplacementNamed(
+                            context,
+                            '/dashboard',
+                            arguments: token,
+                          );
+                        } catch (e) {
+                          if (!context.mounted) return;
+
                           ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text('Login API will be connected next'),
-                            ),
+                            SnackBar(content: Text('Login failed: $e')),
                           );
                         }
                       },

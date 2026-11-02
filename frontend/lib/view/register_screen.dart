@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:mind_ai/const/app_colors.dart';
 import 'package:mind_ai/const/custom_background.dart';
 import 'package:mind_ai/const/custom_button_widget.dart';
+import 'package:mind_ai/repo/auth_repo.dart';
 
 class RegisterScreen extends StatefulWidget {
   const RegisterScreen({super.key});
@@ -16,6 +17,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
   final passwordController = TextEditingController();
 
   bool hidePassword = true;
+  bool isLoading = false;
 
   @override
   void dispose() {
@@ -31,7 +33,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
       body: CustomBackground(
         child: SafeArea(
           child: SingleChildScrollView(
-            padding: EdgeInsets.fromLTRB(24, 12, 24, 20),
+            padding: const EdgeInsets.fromLTRB(24, 12, 24, 20),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -40,11 +42,11 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   children: [
                     IconButton(
                       onPressed: () => Navigator.pop(context),
-                      icon: Icon(Icons.arrow_back_ios_new, size: 18),
+                      icon: const Icon(Icons.arrow_back_ios_new, size: 18),
                     ),
-                    Spacer(),
+                    const Spacer(),
                     Container(
-                      padding: EdgeInsets.all(7),
+                      padding: const EdgeInsets.all(7),
                       decoration: BoxDecoration(
                         color: AppColors.primaryColor,
                         borderRadius: BorderRadius.circular(10),
@@ -58,20 +60,20 @@ class _RegisterScreenState extends State<RegisterScreen> {
                           ),
                         ],
                       ),
-                      child: Icon(
+                      child: const Icon(
                         Icons.menu_book_outlined,
                         color: Colors.white,
                         size: 20,
                       ),
                     ),
-                    SizedBox(width: 8),
-                    Text('MindVault AI', style: TextStyle(fontSize: 15)),
+                    const SizedBox(width: 8),
+                    const Text('MindVault AI', style: TextStyle(fontSize: 15)),
                   ],
                 ),
 
-                SizedBox(height: 46),
+                const SizedBox(height: 46),
 
-                Text(
+                const Text(
                   'Make room for growth.',
                   style: TextStyle(
                     fontSize: 30,
@@ -82,9 +84,9 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   ),
                 ),
 
-                SizedBox(height: 8),
+                const SizedBox(height: 8),
 
-                Text(
+                const Text(
                   'Create your free account. Your next “aha” moment \nstarts here.',
                   style: TextStyle(
                     fontSize: 13,
@@ -93,10 +95,10 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   ),
                 ),
 
-                SizedBox(height: 32),
+                const SizedBox(height: 32),
 
-                Text('Full name', style: TextStyle(fontSize: 12)),
-                SizedBox(height: 9),
+                const Text('Full name', style: TextStyle(fontSize: 12)),
+                const SizedBox(height: 9),
 
                 TextField(
                   controller: nameController,
@@ -106,10 +108,10 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   ),
                 ),
 
-                SizedBox(height: 20),
+                const SizedBox(height: 20),
 
-                Text('Student email', style: TextStyle(fontSize: 12)),
-                SizedBox(height: 9),
+                const Text('Student email', style: TextStyle(fontSize: 12)),
+                const SizedBox(height: 9),
 
                 TextField(
                   controller: emailController,
@@ -120,18 +122,18 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   ),
                 ),
 
-                SizedBox(height: 20),
+                const SizedBox(height: 20),
 
-                Text('Password', style: TextStyle(fontSize: 12)),
-                SizedBox(height: 9),
+                const Text('Password', style: TextStyle(fontSize: 12)),
+                const SizedBox(height: 9),
 
                 TextField(
                   controller: passwordController,
                   obscureText: hidePassword,
                   decoration: InputDecoration(
                     hintText: 'Create a password',
-                    hintStyle: TextStyle(fontSize: 14),
-                    prefixIcon: Icon(Icons.lock_outline, size: 20),
+                    hintStyle: const TextStyle(fontSize: 14),
+                    prefixIcon: const Icon(Icons.lock_outline, size: 20),
                     suffixIcon: IconButton(
                       onPressed: () {
                         setState(() {
@@ -147,7 +149,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
                     ),
                     filled: true,
                     fillColor: Colors.white,
-                    contentPadding: EdgeInsets.symmetric(vertical: 14),
+                    contentPadding: const EdgeInsets.symmetric(vertical: 14),
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(13),
                       borderSide: BorderSide.none,
@@ -155,9 +157,9 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   ),
                 ),
 
-                SizedBox(height: 12),
+                const SizedBox(height: 12),
 
-                Text(
+                const Text(
                   'At least 8 characters. Make it uniquely yours.',
                   style: TextStyle(
                     fontSize: 13,
@@ -166,70 +168,116 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   ),
                 ),
 
-                SizedBox(height: 14),
+                const SizedBox(height: 14),
 
                 SizedBox(
                   width: double.infinity,
                   child: CustomButton(
-                    title: 'Create account',
-                    onPressed: () {
-                      if (nameController.text.trim().isEmpty ||
-                          emailController.text.trim().isEmpty ||
-                          passwordController.text.isEmpty) {
+                    title: isLoading ? 'Creating account...' : 'Create account',
+                    onPressed: () async {
+                      if (isLoading) return;
+
+                      final name = nameController.text.trim();
+                      final email = emailController.text.trim();
+                      final password = passwordController.text;
+
+                      if (name.isEmpty || email.isEmpty || password.isEmpty) {
                         ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text('Please fill all fields')),
+                          const SnackBar(
+                            content: Text('Please fill all fields'),
+                          ),
                         );
-                      } else if (!emailController.text.contains('@')) {
+                        return;
+                      }
+
+                      if (!email.contains('@')) {
                         ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text('Please enter a valid email')),
+                          const SnackBar(
+                            content: Text('Please enter a valid email'),
+                          ),
                         );
-                      } else if (passwordController.text.length < 8) {
+                        return;
+                      }
+
+                      if (password.length < 8) {
                         ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
+                          const SnackBar(
                             content: Text(
                               'Password must be at least 8 characters',
                             ),
                           ),
                         );
-                      } else {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
+                        return;
+                      }
+
+                      final messenger = ScaffoldMessenger.of(context);
+                      final navigator = Navigator.of(context);
+
+                      setState(() {
+                        isLoading = true;
+                      });
+
+                      try {
+                        await AuthRepo().register(
+                          fullName: name,
+                          email: email,
+                          password: password,
+                        );
+
+                        messenger.showSnackBar(
+                          const SnackBar(
                             content: Text(
-                              'Registration API will be connected next',
+                              'Account created successfully! Please sign in.',
                             ),
                           ),
                         );
+
+                        navigator.pushReplacementNamed('/login');
+                      } catch (e) {
+                        messenger.showSnackBar(
+                          SnackBar(
+                            content: Text(
+                              e.toString().replaceFirst('Exception: ', ''),
+                            ),
+                          ),
+                        );
+                      } finally {
+                        if (mounted) {
+                          setState(() {
+                            isLoading = false;
+                          });
+                        }
                       }
                     },
                   ),
                 ),
 
-                SizedBox(height: 14),
+                const SizedBox(height: 14),
 
-                Center(
+                const Center(
                   child: Text(
                     'or continue with',
                     style: TextStyle(fontSize: 13, color: Color(0xFF818092)),
                   ),
                 ),
 
-                SizedBox(height: 12),
+                const SizedBox(height: 12),
 
                 Row(
                   children: [
                     Expanded(
                       child: socialButton(Icons.g_mobiledata_rounded, 'Google'),
                     ),
-                    SizedBox(width: 10),
+                    const SizedBox(width: 10),
                     Expanded(
                       child: socialButton(Icons.school_outlined, 'University'),
                     ),
                   ],
                 ),
 
-                SizedBox(height: 16),
+                const SizedBox(height: 16),
 
-                Center(
+                const Center(
                   child: Text(
                     'By joining, you agree to our Terms of Service '
                     'and Privacy Policy.\nYour PDFs stay private.',
@@ -242,13 +290,13 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   ),
                 ),
 
-                SizedBox(height: 12),
+                const SizedBox(height: 12),
 
                 Center(
                   child: Wrap(
                     alignment: WrapAlignment.center,
                     children: [
-                      Text(
+                      const Text(
                         'Already a member? ',
                         style: TextStyle(fontSize: 14),
                       ),
@@ -256,7 +304,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
                         onTap: () {
                           Navigator.pushNamed(context, '/login');
                         },
-                        child: Text(
+                        child: const Text(
                           'Sign in',
                           style: TextStyle(
                             fontSize: 14,
@@ -280,7 +328,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
     return InputDecoration(
       hintText: hint,
       hintStyle: const TextStyle(fontSize: 13, color: Color(0xFF9290A0)),
-      prefixIcon: Icon(icon, size: 19, color: Color(0xFF777789)),
+      prefixIcon: Icon(icon, size: 19, color: const Color(0xFF777789)),
       filled: true,
       fillColor: Colors.white.withValues(alpha: 0.90),
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 17),
@@ -305,7 +353,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
           );
         },
         icon: Icon(icon, size: 22),
-        label: Text(title, style: TextStyle(fontSize: 13)),
+        label: Text(title, style: const TextStyle(fontSize: 13)),
         style: ElevatedButton.styleFrom(
           backgroundColor: Colors.white,
           foregroundColor: AppColors.blackColor,

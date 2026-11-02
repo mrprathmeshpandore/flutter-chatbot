@@ -10,11 +10,30 @@ from app.schemas import (
     QuizResultOut,
     QuizHistoryItem,
 )
+from app.models import User, Quiz
 from app.services.auth_service import get_current_user
 from app.services.quiz_service import QuizService
 
 router = APIRouter(prefix="/quiz", tags=["Quiz"])
 
+@router.get(
+    "/",
+    response_model=List[QuizOut],
+    summary="Get all quizzes for logged-in user",
+)
+def get_all_quizzes(
+    pdf_id: int = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    query = db.query(Quiz).filter(
+        Quiz.user_id == current_user.id
+    )
+
+    if pdf_id is not None:
+        query = query.filter(Quiz.pdf_id == pdf_id)
+
+    return query.order_by(Quiz.created_at.desc()).all()
 
 @router.post(
     "/generate",

@@ -46,7 +46,7 @@ def db_session() -> Generator[Session, None, None]:
 
 
 @pytest.fixture
-def client(db_session: Session) -> Generator[TestClient, None, None]:
+def client(db_session: Session, monkeypatch) -> Generator[TestClient, None, None]:
     """TestClient that uses the test database session."""
     def override_get_db():
         try:
@@ -55,6 +55,7 @@ def client(db_session: Session) -> Generator[TestClient, None, None]:
             pass
 
     app.dependency_overrides[get_db] = override_get_db
+    monkeypatch.setattr("app.routers.pdf.generate_pdf_quiz_task", lambda pdf_id, user_id: None)
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
@@ -150,7 +151,7 @@ def mock_gemini(monkeypatch, request):
 
     def fake_generate_text(prompt: str, system_instruction: str = None) -> str:
         prompt_lower = prompt.lower()
-        if "quiz" in prompt_lower:
+        if "quiz" in prompt_lower or "multiple-choice" in prompt_lower or "examiner" in prompt_lower or "options" in prompt_lower:
             return '''{
               "title": "Machine Learning Core Quiz",
               "questions": [
@@ -175,6 +176,39 @@ def mock_gemini(monkeypatch, request):
                   ],
                   "correct_option": 0,
                   "explanation": "ReLU avoids vanishing gradients and allows efficient sparse activations."
+                },
+                {
+                  "question_text": "What is overfitting in machine learning?",
+                  "options": [
+                    "Model learns training noise instead of general patterns",
+                    "Model cannot fit simple training data",
+                    "Model runs too slowly on hardware",
+                    "Model has zero trainable parameters"
+                  ],
+                  "correct_option": 0,
+                  "explanation": "Overfitting happens when a model memorizes noise in training data."
+                },
+                {
+                  "question_text": "Which algorithm computes loss gradients using the calculus chain rule?",
+                  "options": [
+                    "Backpropagation",
+                    "Binary search",
+                    "Merge sort",
+                    "Random walk"
+                  ],
+                  "correct_option": 0,
+                  "explanation": "Backpropagation efficiently computes analytical gradients layer by layer."
+                },
+                {
+                  "question_text": "Which hyperparameter scales parameter updates during gradient descent?",
+                  "options": [
+                    "Learning rate",
+                    "Batch size",
+                    "Dropout rate",
+                    "Layer count"
+                  ],
+                  "correct_option": 0,
+                  "explanation": "Learning rate controls the step magnitude along the gradient."
                 }
               ]
             }'''
@@ -200,6 +234,12 @@ def mock_gemini(monkeypatch, request):
                 }
               ]
             }'''
+        elif "pyramid" in prompt_lower or "egypt" in prompt_lower:
+            return (
+                "According to [Page 1], ancient Egyptian pyramids were constructed with remarkable architectural precision."
+            )
+        elif "could not find" in prompt_lower or "no_relevant_content_found" in prompt_lower:
+            return "I could not find this information in your uploaded document."
         elif "explain" in prompt_lower:
             return (
                 "Neural networks are mathematical function approximators inspired by biological neurons. "
@@ -211,4 +251,11 @@ def mock_gemini(monkeypatch, request):
                 "This allows them to recognize complex patterns effectively."
             )
 
+    def fake_generate_text_stream(prompt: str, system_instruction: str = None, timeout_seconds: float = None):
+        full_text = fake_generate_text(prompt, system_instruction)
+        chunk_size = 20
+        for i in range(0, len(full_text), chunk_size):
+            yield full_text[i:i + chunk_size]
+
     monkeypatch.setattr(AIService, "generate_text", fake_generate_text)
+    monkeypatch.setattr(AIService, "generate_text_stream", fake_generate_text_stream)

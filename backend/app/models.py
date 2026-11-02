@@ -21,6 +21,8 @@ class User(Base):
     email = Column(String(255), unique=True, index=True, nullable=False)
     full_name = Column(String(255), nullable=True)
     hashed_password = Column(String(255), nullable=False)
+    phone_number = Column(String(50), nullable=True)
+    profile_image = Column(String(500), nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -48,8 +50,13 @@ class PDFDocument(Base):
     owner = relationship("User", back_populates="pdf_documents")
     pages = relationship("PDFPage", back_populates="pdf", cascade="all, delete-orphan", order_by="PDFPage.page_number")
     learning_path = relationship("LearningPath", back_populates="pdf", uselist=False, cascade="all, delete-orphan")
-    quizzes = relationship("Quiz", back_populates="pdf")
+    quizzes = relationship(
+    "Quiz",
+    back_populates="pdf",
+    cascade="all, delete-orphan",
+)
     explanations = relationship("TopicExplanation", back_populates="pdf", cascade="all, delete-orphan")
+    progress_logs = relationship("ProgressLog", back_populates="pdf", cascade="all, delete-orphan")
 
 
 class PDFPage(Base):
@@ -100,7 +107,12 @@ class Quiz(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
-    pdf_id = Column(Integer, ForeignKey("pdf_documents.id", ondelete="SET NULL"), index=True, nullable=True)
+    pdf_id = Column(
+    Integer,
+    ForeignKey("pdf_documents.id", ondelete="CASCADE"),
+    index=True,
+    nullable=True,
+)
     title = Column(String(255), nullable=False)
     topic = Column(String(255), nullable=True)
     difficulty = Column(String(50), default="medium")
@@ -151,6 +163,7 @@ class ProgressLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    pdf_id = Column(Integer, ForeignKey("pdf_documents.id", ondelete="CASCADE"), index=True, nullable=True)
     activity_type = Column(String(50), nullable=False)  # e.g., 'quiz_completed', 'pdf_uploaded', 'learning_path_generated'
     subject = Column(String(255), nullable=True)
     score = Column(Float, nullable=True)
@@ -159,3 +172,4 @@ class ProgressLog(Base):
 
     # Relationships
     user = relationship("User", back_populates="progress_logs")
+    pdf = relationship("PDFDocument", back_populates="progress_logs")

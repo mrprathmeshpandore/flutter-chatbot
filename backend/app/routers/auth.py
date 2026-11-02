@@ -1,8 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+import os
+import uuid
+import logging
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from app.config import settings
 from app.database import get_db
 from app.models import User
-from app.schemas import UserRegister, UserLogin, UserOut, Token
+from app.schemas import UserRegister, UserLogin, UserOut, UserUpdate, Token
 from app.services.auth_service import (
     get_password_hash,
     verify_password,
@@ -10,7 +15,23 @@ from app.services.auth_service import (
     get_current_user,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+ALLOWED_AVATAR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+ALLOWED_AVATAR_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
+MAX_AVATAR_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def _validate_image_magic_bytes(content: bytes, ext: str) -> bool:
+    if ext in (".jpg", ".jpeg"):
+        return content.startswith(b"\xff\xd8\xff")
+    if ext == ".png":
+        return content.startswith(b"\x89PNG\r\n\x1a\n")
+    if ext == ".webp":
+        return len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP"
+    return False
 
 
 @router.post(
@@ -95,3 +116,164 @@ def get_me(current_user: User = Depends(get_current_user)):
     Returns the profile information of the currently authenticated user.
     """
     return current_user
+
+
+@router.put(
+    "/me",
+    response_model=UserOut,
+    summary="Update authenticated user profile information",
+)
+def update_me(
+    user_in: UserUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Updates the authenticated user's profile information (full_name, email, phone_number).
+    Validates email uniqueness and input formats.
+    """
+    if user_in.email is not None:
+        normalized_email = user_in.email.lower().strip()
+        if normalized_email != current_user.email:
+            existing = db.query(User).filter(User.email == normalized_email, User.id != current_user.id).first()
+            if existing:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="A user with this email address already exists.",
+                )
+            current_user.email = normalized_email
+
+    if user_in.full_name is not None:
+        current_user.full_name = user_in.full_name.strip()
+
+    if user_in.phone_number is not None:
+        current_user.phone_number = user_in.phone_number.strip()
+
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+
+@router.post(
+    "/me/avatar",
+    response_model=UserOut,
+    summary="Upload or update authenticated user profile avatar photo",
+)
+async def upload_avatar(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Uploads a new profile avatar photo from phone gallery.
+    Validates file extension, mime type, size, and magic bytes.
+    Saves securely in uploads/avatars/ and updates user profile.
+    """
+    if not file.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No filename provided for uploaded avatar.",
+        )
+
+    _, ext = os.path.splitext(file.filename.lower())
+    if ext not in ALLOWED_AVATAR_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported image type '{ext}'. Allowed types: {', '.join(sorted(ALLOWED_AVATAR_EXTENSIONS))}",
+        )
+
+    if file.content_type and file.content_type.lower() not in ALLOWED_AVATAR_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid MIME type '{file.content_type}'. Must be a JPEG, PNG, or WEBP image.",
+        )
+
+    # Read image content with size limit check
+    content = await file.read()
+    if len(content) > MAX_AVATAR_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Image file size ({len(content) // 1024} KB) exceeds the maximum allowed size of 5 MB.",
+        )
+
+    if not _validate_image_magic_bytes(content, ext):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File content does not match a valid image format.",
+        )
+
+    avatar_dir = os.path.join(settings.UPLOAD_DIR, "avatars")
+    os.makedirs(avatar_dir, exist_ok=True)
+
+    # Clean up previous avatar file if exists
+    if current_user.profile_image and current_user.profile_image.startswith("/auth/avatar/"):
+        old_filename = os.path.basename(current_user.profile_image)
+        old_path = os.path.join(avatar_dir, old_filename)
+        if os.path.isfile(old_path):
+            try:
+                os.remove(old_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove previous avatar file {old_path}: {e}")
+
+    unique_filename = f"user_{current_user.id}_{uuid.uuid4().hex[:10]}{ext}"
+    dest_path = os.path.join(avatar_dir, unique_filename)
+
+    with open(dest_path, "wb") as f:
+        f.write(content)
+
+    current_user.profile_image = f"/auth/avatar/{unique_filename}"
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+
+@router.delete(
+    "/me/avatar",
+    response_model=UserOut,
+    summary="Remove authenticated user profile avatar photo",
+)
+def delete_avatar(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Removes the user's profile avatar photo and deletes the file from disk.
+    """
+    if current_user.profile_image:
+        if current_user.profile_image.startswith("/auth/avatar/"):
+            old_filename = os.path.basename(current_user.profile_image)
+            avatar_dir = os.path.join(settings.UPLOAD_DIR, "avatars")
+            old_path = os.path.join(avatar_dir, old_filename)
+            if os.path.isfile(old_path):
+                try:
+                    os.remove(old_path)
+                except Exception as e:
+                    logger.warning(f"Failed to remove avatar file {old_path}: {e}")
+
+        current_user.profile_image = None
+        db.commit()
+        db.refresh(current_user)
+
+    return current_user
+
+
+@router.get(
+    "/avatar/{filename}",
+    summary="Serve profile avatar image",
+)
+def get_avatar(filename: str):
+    """
+    Safely serves an uploaded user profile avatar image.
+    """
+    safe_filename = os.path.basename(filename)
+    avatar_dir = os.path.join(settings.UPLOAD_DIR, "avatars")
+    file_path = os.path.join(avatar_dir, safe_filename)
+
+    if not os.path.isfile(file_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Avatar image not found.",
+        )
+
+    return FileResponse(file_path)
+

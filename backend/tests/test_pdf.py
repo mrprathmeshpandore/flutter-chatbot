@@ -119,14 +119,20 @@ def test_get_pdf_unauthorized_user(client: TestClient, auth_headers, second_auth
     assert "permission" in response.json()["detail"].lower()
 
 
-def test_delete_pdf(client: TestClient, auth_headers, sample_pdf_bytes):
-    """Test deleting an uploaded PDF document."""
+def test_delete_pdf(client: TestClient, auth_headers, sample_pdf_bytes, db_session):
+    """Test deleting an uploaded PDF document and cascading related data."""
+    from app.models import ProgressLog, Quiz
+
     upload_res = client.post(
         "/pdf/upload",
         headers=auth_headers,
         files={"file": ("to_delete.pdf", sample_pdf_bytes, "application/pdf")},
     )
     pdf_id = upload_res.json()["id"]
+
+    # Verify progress log was created with pdf_id
+    logs_before = db_session.query(ProgressLog).filter(ProgressLog.pdf_id == pdf_id).all()
+    assert len(logs_before) >= 1
 
     delete_res = client.delete(f"/pdf/{pdf_id}", headers=auth_headers)
     assert delete_res.status_code == 200
@@ -135,3 +141,33 @@ def test_delete_pdf(client: TestClient, auth_headers, sample_pdf_bytes):
     # Verify document no longer exists
     get_res = client.get(f"/pdf/{pdf_id}", headers=auth_headers)
     assert get_res.status_code == 404
+
+    # Verify progress logs for this PDF were cascade-deleted
+    logs_after = db_session.query(ProgressLog).filter(ProgressLog.pdf_id == pdf_id).all()
+    assert len(logs_after) == 0
+
+    # Verify recent activity on dashboard omits the deleted PDF
+    summary_res = client.get("/progress/summary", headers=auth_headers)
+    assert summary_res.status_code == 200
+    recent = summary_res.json().get("recent_activity", [])
+    for activity in recent:
+        assert "to_delete" not in activity["subject"].lower()
+
+
+def test_upload_pdf_with_no_extractable_text(client: TestClient, auth_headers):
+    """Test that a valid PDF structure with 0 extractable characters is properly rejected."""
+    empty_pdf = (
+        b"%PDF-1.4\n"
+        b"1 0 obj <</Type /Catalog /Pages 2 0 R>> endobj\n"
+        b"2 0 obj <</Type /Pages /Kids [3 0 R] /Count 1>> endobj\n"
+        b"3 0 obj <</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>> endobj\n"
+        b"xref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n"
+        b"trailer <</Size 4 /Root 1 0 R>>\nstartxref\n195\n%%EOF\n"
+    )
+    response = client.post(
+        "/pdf/upload",
+        headers=auth_headers,
+        files={"file": ("scanned_blank.pdf", empty_pdf, "application/pdf")},
+    )
+    assert response.status_code == 400
+    assert "no extractable text" in response.json()["detail"].lower()

@@ -1,10 +1,17 @@
 import 'package:flutter/material.dart';
+import 'package:mind_ai/view/chatbot_screen.dart';
+import 'package:mind_ai/view/dashboard_screen.dart';
+import 'package:mind_ai/view/growth_screen.dart';
+import 'package:mind_ai/view/learning_path_screen.dart';
 import 'package:mind_ai/view/login_screen.dart';
+import 'package:mind_ai/view/my_library_screen.dart';
+import 'package:mind_ai/view/profile_screen.dart';
+import 'package:mind_ai/view/quiz_screen.dart';
 import 'package:mind_ai/view/register_screen.dart';
 import 'package:mind_ai/view/welcome_screen.dart';
 
 void main() {
-  runApp(MyApp());
+  runApp(const MyApp());
 }
 
 class MyApp extends StatefulWidget {
@@ -37,8 +44,14 @@ class _MyAppState extends State<MyApp> {
         '/': (context) => const WelcomeScreen(),
         '/login': (context) => const LoginScreen(),
         '/register': (context) => const RegisterScreen(),
+        '/dashboard': (context) => const DashboardScreen(),
+        '/profile': (context) => const ProfileScreen(),
+        '/chatbot': (context) => const ChatbotScreen(),
+        '/my-library': (context) => const MyLibraryScreen(),
+        '/learning-path': (context) => const LearningPathScreen(),
+        '/quiz': (context) => const QuizScreen(),
+        '/growth': (context) => const GrowthScreen(),
       },
-      
     );
   }
 }

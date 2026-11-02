@@ -3,12 +3,12 @@ import logging
 import random
 import re
 import time
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Generator
 import httpx
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import PDFDocument, PDFPage
-from app.services.pdf_service import search_relevant_pages
+from app.services.pdf_service import search_relevant_pages, search_relevant_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -267,80 +267,341 @@ class AIService:
         cls._raise_mapped_error(last_status_code, last_reason, last_error)
 
     @classmethod
+    def generate_text_stream(
+        cls,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> Generator[str, None, None]:
+        """
+        Sends a streaming generation request to the Gemini API with native streaming,
+        yielding incremental text chunks with minimal Time To First Token (TTFT).
+        """
+        if not settings.GEMINI_API_KEY:
+            raise AIServiceConfigurationError(
+                message="Gemini API key is not configured. Please set GEMINI_API_KEY in backend/.env.",
+                status_code=503,
+            )
+
+        client = cls.get_client()
+        if not client:
+            raise AIServiceConfigurationError(
+                message="Failed to initialize Gemini AI client. Please check your configuration.",
+                status_code=503,
+            )
+
+        full_prompt = prompt
+        if system_instruction:
+            full_prompt = f"System Instructions:\n{system_instruction}\n\nUser Request:\n{prompt}"
+
+        effective_timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else getattr(settings, "GEMINI_TIMEOUT_SECONDS", 12.0)
+        )
+        timeout_ms = int(max(0.1, effective_timeout) * 1000)
+
+        response_stream = None
+        try:
+            from google.genai import types
+            config = types.GenerateContentConfig(
+                http_options=types.HttpOptions(timeout=timeout_ms)
+            )
+            response_stream = client.models.generate_content_stream(
+                model=settings.GEMINI_MODEL,
+                contents=full_prompt,
+                config=config,
+            )
+        except (TypeError, AttributeError):
+            try:
+                response_stream = client.models.generate_content_stream(
+                    model=settings.GEMINI_MODEL,
+                    contents=full_prompt,
+                )
+            except Exception as exc:
+                is_transient, status_code, reason = is_transient_gemini_error(exc)
+                safe_err = sanitize_gemini_error(str(exc))
+                logger.error(
+                    f"Gemini API streaming error ({reason}, code={status_code}): {safe_err}"
+                )
+                cls._raise_mapped_error(status_code, reason, exc)
+        except Exception as exc:
+            is_transient, status_code, reason = is_transient_gemini_error(exc)
+            safe_err = sanitize_gemini_error(str(exc))
+            logger.error(
+                f"Gemini API streaming error ({reason}, code={status_code}): {safe_err}"
+            )
+            cls._raise_mapped_error(status_code, reason, exc)
+
+        if response_stream is not None:
+            try:
+                for chunk in response_stream:
+                    if chunk.text:
+                        yield chunk.text
+            except Exception as exc:
+                is_transient, status_code, reason = is_transient_gemini_error(exc)
+                safe_err = sanitize_gemini_error(str(exc))
+                logger.error(
+                    f"Gemini API streaming chunk iteration error ({reason}, code={status_code}): {safe_err}"
+                )
+                cls._raise_mapped_error(status_code, reason, exc)
+
+    @classmethod
+    def _build_ai_teacher_prompt(
+        cls,
+        question: str,
+        pdf: Optional[PDFDocument],
+        db: Session,
+        history: Optional[List[Dict[str, str]]] = None,
+        user_name: Optional[str] = None,
+    ) -> Tuple[str, str, List[int], bool]:
+        """
+        Builds the grounded RAG context, strict document-only instructions,
+        personalized student name context, and full prompt for AI Teacher.
+        Returns (full_prompt, system_instruction, source_pages, has_relevant_content).
+        """
+        source_pages: List[int] = []
+        context_str = ""
+        has_relevant_content = True
+
+        # Retrieve relevant PDF chunks using semantic thresholded search
+        if pdf:
+            relevant_chunks, max_score = search_relevant_chunks(
+                pdf_id=pdf.id,
+                query=question,
+                db=db,
+            )
+
+            if relevant_chunks:
+                source_pages = sorted(list(set(c["page_number"] for c in relevant_chunks)))
+                context_blocks = []
+                for chunk in relevant_chunks:
+                    page_number = chunk["page_number"]
+                    context_blocks.append(
+                        f"--- [Page {page_number}] ---\n"
+                        f"{chunk['text']}\n"
+                    )
+                context_str = "\n".join(context_blocks)
+            else:
+                has_relevant_content = False
+                context_str = (
+                    "NO_RELEVANT_CONTENT_FOUND_IN_UPLOADED_PDF. "
+                    "The uploaded document does not contain information to answer this question."
+                )
+
+        clean_name = user_name.strip() if user_name and user_name.strip() else None
+        name_instruction = ""
+        if clean_name:
+            name_instruction = (
+                f"STUDENT PROFILE:\n"
+                f"- The student's registered name is '{clean_name}'.\n"
+                f"- Address the student naturally by their name where appropriate (e.g., in greetings or encouragement, such as 'Sure {clean_name}, let's look at this concept').\n"
+                f"- Do NOT repeat the student's name unnaturally in every single sentence.\n"
+                f"- Personalization must NEVER override document grounding, factual accuracy, or safety guidelines.\n\n"
+            )
+
+        if pdf:
+            system_instruction = (
+                f"You are MindVault AI, an academic assistant analyzing the user's uploaded document: '{pdf.title}'.\n\n"
+                f"{name_instruction}"
+                "CRITICAL GROUNDING RULES:\n"
+                "1. Answer the student's question STRICTLY and EXCLUSIVELY based on the DOCUMENT CONTEXT provided below.\n"
+                "2. Cite facts from the document using exact bracketed page citations like [Page 1] or [Page 2].\n"
+                "3. NEVER use general knowledge, external assumptions, or outside training data to answer or embellish.\n"
+                "4. If the provided DOCUMENT CONTEXT does not contain enough information to fully answer the question, state EXACTLY:\n"
+                "'I could not find this information in your uploaded document.'\n"
+                "Do NOT attempt to guess, hypothesize, or provide a general educational explanation.\n"
+                "5. Maintain clean markdown formatting with headings and bullet points where helpful."
+            )
+        else:
+            system_instruction = (
+                "You are MindVault AI, an inspiring, empathetic, and expert Personal AI Teacher. "
+                "Your mission is to help students understand concepts with maximum clarity, intelligence, and structure.\n\n"
+                f"{name_instruction}"
+                "ADAPTIVE PROGRESSIVE ANSWER STRUCTURE:\n"
+                "- Simple questions: Give a clear, direct, and complete answer in 1-2 short paragraphs.\n"
+                "- Step-by-step or process questions: Use clean numbered steps (1., 2., 3.) with bold action phrases.\n"
+                "- Technical or complex concepts: Start with a clear 1-2 sentence core definition. "
+                "Follow with '### How It Works' or '### Key Concepts' using concise bullet points. "
+                "Conclude with '### Why It Matters' or a real-world takeaway.\n"
+                "- Coding questions: Provide a brief explanation followed by clean, formatted code blocks with syntax highlighting and helpful comments.\n"
+                "- Readability rules: Break text into short, digestible paragraphs (2-3 sentences max). Use bold text for key terms. Avoid monolithic walls of text."
+            )
+
+        prompt_parts = []
+        if context_str:
+            prompt_parts.append(
+                f"DOCUMENT CONTEXT (PDF: '{pdf.title}'):\n"
+                f"{context_str}\n"
+            )
+
+        if history:
+            prompt_parts.append("CONVERSATION HISTORY:")
+            for msg in history[-4:]:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                prompt_parts.append(f"{role.title()}: {content}")
+            prompt_parts.append("")
+
+        prompt_parts.append(f"STUDENT QUESTION: {question}")
+        full_prompt = "\n".join(prompt_parts)
+
+        return full_prompt, system_instruction, source_pages, has_relevant_content
+
+    @classmethod
     def ask_ai_teacher(
         cls,
         question: str,
         pdf: Optional[PDFDocument],
         db: Session,
         history: Optional[List[Dict[str, str]]] = None,
+        user_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Answers student questions. When a PDF is provided, strictly grounds the answer
-        in the extracted text and includes exact page references. Never invents citations.
+        Non-streaming personal AI teacher response strictly grounded in document context.
         """
-        source_pages: List[int] = []
-        context_str = ""
-
-        if pdf:
-            relevant_pages = search_relevant_pages(pdf.id, question, db, max_pages=4)
-            if relevant_pages:
-                context_chunks = []
-                for p in relevant_pages:
-                    source_pages.append(p["page_number"])
-                    context_chunks.append(
-                        f"--- [Page {p['page_number']}] ---\n{p['text']}\n"
-                    )
-                context_str = "\n".join(context_chunks)
-
-        system_instruction = (
-            "You are MindVault AI, an inspiring, empathetic, and expert Personal AI Teacher. "
-            "Your mission is to help the student truly understand concepts and build mastery.\n\n"
-            "STRICT GROUNDING & CITATION RULES:\n"
-            "1. When DOCUMENT CONTEXT is provided, answer using that context.\n"
-            "2. Whenever citing facts or concepts found in the context, explicitly reference the page number in square brackets (e.g., '[Page 2]').\n"
-            "3. DO NOT INVENT citations or pretend an answer came from a PDF if it was not in the text.\n"
-            "4. If the document does not contain the answer, explicitly state: "
-            "'This specific topic is not covered in the uploaded document.' "
-            "Then, provide a helpful general explanation clearly marked as general educational knowledge.\n"
-            "5. If NO DOCUMENT CONTEXT is provided, answer using your general teaching expertise without inventing any source pages.\n"
-            "6. Use clear formatting with bullet points and bold headers for readability."
+        full_prompt, system_instruction, source_pages, has_relevant_content = (
+            cls._build_ai_teacher_prompt(
+                question=question,
+                pdf=pdf,
+                db=db,
+                history=history,
+                user_name=user_name,
+            )
         )
 
-        prompt_parts = []
-        if context_str:
-            prompt_parts.append(
-                f"DOCUMENT CONTEXT (From PDF: '{pdf.title}'):\n{context_str}\n"
+        # Fast exit if PDF is attached but query contains zero relevant content
+        if pdf and not has_relevant_content:
+            logger.info(
+                "RAG Grounding Guard | pdf_id=%s, question='%s' -> No relevant content found",
+                pdf.id,
+                question[:50],
             )
+            return {
+                "answer": "I could not find this information in your uploaded document.",
+                "source_pages": [],
+                "used_pdf": True,
+                "pdf_id": pdf.id,
+            }
 
-        if history:
-            prompt_parts.append("CONVERSATION HISTORY:")
-            for msg in history[-4:]:
-                prompt_parts.append(f"{msg.get('role', 'user').title()}: {msg.get('content', '')}")
-            prompt_parts.append("")
+        # Generate AI answer
+        raw_answer = cls.generate_text(
+            full_prompt,
+            system_instruction=system_instruction,
+        )
 
-        prompt_parts.append(f"STUDENT QUESTION: {question}")
-        full_prompt = "\n".join(prompt_parts)
-
-        # Call Gemini
-        raw_answer = cls.generate_text(full_prompt, system_instruction=system_instruction)
-
-        # Extract which source pages were actually cited in the answer (e.g., [Page 1], [Page 3])
+        # Keep only valid page citations
         cited_pages = []
-        for match in re.findall(r"\[Page\s*(\d+)\]", raw_answer, re.IGNORECASE):
-            try:
-                page_num = int(match)
-                if page_num in source_pages and page_num not in cited_pages:
-                    cited_pages.append(page_num)
-            except ValueError:
-                pass
+        for match in re.findall(
+            r"\[Page\s*(\d+)\]",
+            raw_answer,
+            re.IGNORECASE,
+        ):
+            page_num = int(match)
+            if page_num in source_pages and page_num not in cited_pages:
+                cited_pages.append(page_num)
 
-        final_sources = cited_pages if cited_pages else source_pages
+        # If answer states information was not found, citations must be empty
+        if "could not find" in raw_answer.lower() and "document" in raw_answer.lower():
+            cited_pages = []
 
         return {
             "answer": raw_answer,
-            "source_pages": sorted(final_sources) if pdf else [],
+            "source_pages": sorted(cited_pages) if pdf else [],
             "used_pdf": bool(pdf),
             "pdf_id": pdf.id if pdf else None,
+        }
+
+    @classmethod
+    def ask_ai_teacher_stream(
+        cls,
+        question: str,
+        pdf: Optional[PDFDocument],
+        db: Session,
+        history: Optional[List[Dict[str, str]]] = None,
+        user_name: Optional[str] = None,
+    ) -> Generator[Dict[str, Any], None, None]:
+        """
+        Streaming personal AI teacher generator yielding initial metadata,
+        real-time tokens, and final citation verification.
+        """
+        full_prompt, system_instruction, source_pages, has_relevant_content = (
+            cls._build_ai_teacher_prompt(
+                question=question,
+                pdf=pdf,
+                db=db,
+                history=history,
+                user_name=user_name,
+            )
+        )
+
+        # Fast exit if PDF is attached but query contains zero relevant content
+        if pdf and not has_relevant_content:
+            logger.info(
+                "RAG Stream Grounding Guard | pdf_id=%s, question='%s' -> No relevant content found",
+                pdf.id,
+                question[:50],
+            )
+            yield {
+                "type": "metadata",
+                "used_pdf": True,
+                "pdf_id": pdf.id,
+                "source_pages": [],
+            }
+            yield {
+                "type": "token",
+                "text": "I could not find this information in your uploaded document.",
+            }
+            yield {
+                "type": "done",
+                "source_pages": [],
+                "used_pdf": True,
+                "pdf_id": pdf.id,
+                "full_answer": "I could not find this information in your uploaded document.",
+            }
+            return
+
+        # 1. Immediately yield metadata so client can prepare UI
+        yield {
+            "type": "metadata",
+            "used_pdf": bool(pdf),
+            "pdf_id": pdf.id if pdf else None,
+            "source_pages": source_pages,
+        }
+
+        # 2. Stream incremental text tokens with zero artificial delay
+        full_answer = ""
+        for chunk in cls.generate_text_stream(
+            full_prompt,
+            system_instruction=system_instruction,
+        ):
+            full_answer += chunk
+            yield {
+                "type": "token",
+                "text": chunk,
+            }
+
+        # 3. Compute final valid citations
+        cited_pages = []
+        for match in re.findall(
+            r"\[Page\s*(\d+)\]",
+            full_answer,
+            re.IGNORECASE,
+        ):
+            page_num = int(match)
+            if page_num in source_pages and page_num not in cited_pages:
+                cited_pages.append(page_num)
+
+        if "could not find" in full_answer.lower() and "document" in full_answer.lower():
+            cited_pages = []
+
+        # 4. Yield completion event
+        yield {
+            "type": "done",
+            "source_pages": sorted(cited_pages) if pdf else [],
+            "used_pdf": bool(pdf),
+            "pdf_id": pdf.id if pdf else None,
+            "full_answer": full_answer,
         }
 
     @classmethod
