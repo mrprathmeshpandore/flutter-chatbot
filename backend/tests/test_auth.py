@@ -192,3 +192,83 @@ def test_avatar_invalid_format(client: TestClient, auth_headers):
     assert response.status_code == 400
     assert "does not match" in response.json()["detail"].lower()
 
+
+def test_avatar_jpg_upload(client: TestClient, auth_headers):
+    """Test uploading a valid JPG image."""
+    jpg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00C\x00\x01\xff\xd9"
+    response = client.post(
+        "/auth/me/avatar",
+        headers=auth_headers,
+        files={"file": ("profile.jpg", jpg_bytes, "image/jpeg")},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["profile_image"] is not None
+    assert data["profile_image"].endswith(".jpg")
+
+
+def test_avatar_jpeg_upload(client: TestClient, auth_headers):
+    """Test uploading a valid JPEG image."""
+    jpeg_bytes = b"\xff\xd8\xff\xe1\x00\x18Exif\x00\x00II*\x00\x08\x00\x00\x00\x00\x00\x00\x00\xff\xd9"
+    response = client.post(
+        "/auth/me/avatar",
+        headers=auth_headers,
+        files={"file": ("photo.jpeg", jpeg_bytes, "image/jpeg")},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["profile_image"] is not None
+    assert data["profile_image"].endswith(".jpeg")
+
+
+def test_avatar_webp_upload(client: TestClient, auth_headers):
+    """Test uploading a valid WEBP image."""
+    webp_bytes = b"RIFF\x18\x00\x00\x00WEBPVP8 \x0c\x00\x00\x000\x01\x00\x9d\x01*\x01\x00\x01\x00\x00\x00"
+    response = client.post(
+        "/auth/me/avatar",
+        headers=auth_headers,
+        files={"file": ("avatar.webp", webp_bytes, "image/webp")},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["profile_image"] is not None
+    assert data["profile_image"].endswith(".webp")
+
+
+def test_avatar_android_octet_stream_upload(client: TestClient, auth_headers):
+    """Test uploading an image when Android sends application/octet-stream MIME type."""
+    jpg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+    response = client.post(
+        "/auth/me/avatar",
+        headers=auth_headers,
+        files={"file": ("1000000001.jpg", jpg_bytes, "application/octet-stream")},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["profile_image"] is not None
+    assert data["profile_image"].startswith("/auth/avatar/")
+
+
+def test_avatar_disallowed_mime_type(client: TestClient, auth_headers):
+    """Test that non-image MIME types like application/pdf or text/html are rejected."""
+    pdf_bytes = b"%PDF-1.4 sample content"
+    response = client.post(
+        "/auth/me/avatar",
+        headers=auth_headers,
+        files={"file": ("document.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert response.status_code == 400
+    assert "invalid mime type" in response.json()["detail"].lower()
+
+
+def test_avatar_mismatched_extension(client: TestClient, auth_headers):
+    """Test that claiming to be .png while bytes are JPEG is rejected."""
+    jpg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+    response = client.post(
+        "/auth/me/avatar",
+        headers=auth_headers,
+        files={"file": ("fake_png.png", jpg_bytes, "image/png")},
+    )
+    assert response.status_code == 400
+
+

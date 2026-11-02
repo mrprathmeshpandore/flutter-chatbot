@@ -20,18 +20,43 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 ALLOWED_AVATAR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-ALLOWED_AVATAR_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
+ALLOWED_AVATAR_MIME_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/jpg",
+    "image/pjpeg",
+    "image/x-png",
+    "application/octet-stream",
+}
 MAX_AVATAR_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
 
 
-def _validate_image_magic_bytes(content: bytes, ext: str) -> bool:
-    if ext in (".jpg", ".jpeg"):
-        return content.startswith(b"\xff\xd8\xff")
-    if ext == ".png":
-        return content.startswith(b"\x89PNG\r\n\x1a\n")
-    if ext == ".webp":
-        return len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP"
-    return False
+def detect_image_format_from_magic_bytes(content: bytes) -> tuple[str | None, str | None]:
+    """
+    Safely determines the actual image type and canonical extension from binary magic bytes.
+    Validates:
+      - JPEG: FF D8 FF
+      - PNG:  89 50 4E 47 (\x89PNG)
+      - WEBP: RIFF....WEBP (offset 0: 'RIFF', offset 8..12: 'WEBP')
+    Returns (detected_mime, canonical_ext) or (None, None).
+    """
+    if len(content) < 3:
+        return None, None
+
+    # JPEG: starts with FF D8 FF
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", ".jpg"
+
+    # PNG: starts with 89 50 4E 47 (\x89PNG)
+    if content.startswith(b"\x89PNG") or content.startswith(b"\x89\x50\x4e\x47"):
+        return "image/png", ".png"
+
+    # WEBP: RIFF header with WEBP identifier at offset 8..12
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+
+    return None, None
 
 
 @router.post(
@@ -166,7 +191,7 @@ async def upload_avatar(
 ):
     """
     Uploads a new profile avatar photo from phone gallery.
-    Validates file extension, mime type, size, and magic bytes.
+    Validates file extension, client MIME type, binary magic bytes, and file size.
     Saves securely in uploads/avatars/ and updates user profile.
     """
     if not file.filename:
@@ -175,32 +200,77 @@ async def upload_avatar(
             detail="No filename provided for uploaded avatar.",
         )
 
-    _, ext = os.path.splitext(file.filename.lower())
-    if ext not in ALLOWED_AVATAR_EXTENSIONS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported image type '{ext}'. Allowed types: {', '.join(sorted(ALLOWED_AVATAR_EXTENSIONS))}",
-        )
+    # 1. Validate client-supplied MIME type (reject non-image / dangerous MIME types upfront)
+    raw_mime = None
+    if file.content_type:
+        raw_mime = file.content_type.lower().split(";")[0].strip()
+        if raw_mime not in ALLOWED_AVATAR_MIME_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid MIME type '{file.content_type}'. Must be a JPEG, PNG, or WEBP image.",
+            )
 
-    if file.content_type and file.content_type.lower() not in ALLOWED_AVATAR_MIME_TYPES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid MIME type '{file.content_type}'. Must be a JPEG, PNG, or WEBP image.",
-        )
-
-    # Read image content with size limit check
+    # 2. Read image content with size limit check
     content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty.",
+        )
     if len(content) > MAX_AVATAR_SIZE_BYTES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Image file size ({len(content) // 1024} KB) exceeds the maximum allowed size of 5 MB.",
         )
 
-    if not _validate_image_magic_bytes(content, ext):
+    # 3. Inspect binary magic bytes to safely determine the true image format
+    detected_mime, canonical_ext = detect_image_format_from_magic_bytes(content)
+    if not detected_mime or not canonical_ext:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File content does not match a valid image format.",
+            detail="File content does not match a valid image format. Must be a JPEG, PNG, or WEBP image.",
         )
+
+    # 4. Cross-validate client-supplied image MIME type with actual detected format
+    if raw_mime and raw_mime != "application/octet-stream":
+        if raw_mime in {"image/jpeg", "image/jpg", "image/pjpeg"} and detected_mime != "image/jpeg":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Supplied MIME type '{file.content_type}' does not match actual image content.",
+            )
+        elif raw_mime in {"image/png", "image/x-png"} and detected_mime != "image/png":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Supplied MIME type '{file.content_type}' does not match actual image content.",
+            )
+        elif raw_mime == "image/webp" and detected_mime != "image/webp":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Supplied MIME type '{file.content_type}' does not match actual image content.",
+            )
+
+    # 5. Check and resolve file extension
+    _, raw_ext = os.path.splitext(file.filename.lower())
+    if raw_ext in ALLOWED_AVATAR_EXTENSIONS:
+        if raw_ext in {".jpg", ".jpeg"} and detected_mime != "image/jpeg":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File extension '{raw_ext}' does not match actual {detected_mime} image content.",
+            )
+        if raw_ext == ".png" and detected_mime != "image/png":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File extension '{raw_ext}' does not match actual {detected_mime} image content.",
+            )
+        if raw_ext == ".webp" and detected_mime != "image/webp":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File extension '{raw_ext}' does not match actual {detected_mime} image content.",
+            )
+        final_ext = raw_ext
+    else:
+        # Fallback to canonical extension detected from magic bytes
+        final_ext = canonical_ext
 
     avatar_dir = os.path.join(settings.UPLOAD_DIR, "avatars")
     os.makedirs(avatar_dir, exist_ok=True)
@@ -215,7 +285,7 @@ async def upload_avatar(
             except Exception as e:
                 logger.warning(f"Failed to remove previous avatar file {old_path}: {e}")
 
-    unique_filename = f"user_{current_user.id}_{uuid.uuid4().hex[:10]}{ext}"
+    unique_filename = f"user_{current_user.id}_{uuid.uuid4().hex[:10]}{final_ext}"
     dest_path = os.path.join(avatar_dir, unique_filename)
 
     with open(dest_path, "wb") as f:

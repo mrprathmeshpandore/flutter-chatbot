@@ -143,12 +143,20 @@ class _ProfileScreenState extends State<ProfileScreen> {
         return;
       }
 
+      String filename = file.name;
+      if (filename.isEmpty && file.path != null) {
+        filename = file.path!.split(Platform.pathSeparator).last;
+      }
+      if (filename.isEmpty) {
+        filename = 'profile_photo.jpg';
+      }
+
       setState(() => _isUploadingPhoto = true);
 
       final updatedUser = await _userRepo.uploadAvatar(
         token: _token,
         bytes: bytes,
-        filename: file.name,
+        filename: filename,
       );
 
       if (mounted) {

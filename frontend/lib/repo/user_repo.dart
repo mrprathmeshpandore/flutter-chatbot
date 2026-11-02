@@ -1,11 +1,75 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:mind_ai/const/api_constants.dart';
 import 'package:mind_ai/model/user_model.dart';
 
 class UserRepo {
   static const String _cachedUserKey = 'mindvault_cached_user_profile';
+
+  static MediaType resolveImageMediaType(List<int> bytes, String filename) {
+    // 1. Detect image type from binary magic bytes
+    if (bytes.length >= 3 &&
+        bytes[0] == 0xFF &&
+        bytes[1] == 0xD8 &&
+        bytes[2] == 0xFF) {
+      return MediaType('image', 'jpeg');
+    }
+
+    if (bytes.length >= 4 &&
+        bytes[0] == 0x89 &&
+        bytes[1] == 0x50 && // P
+        bytes[2] == 0x4E && // N
+        bytes[3] == 0x47) { // G
+      return MediaType('image', 'png');
+    }
+
+    if (bytes.length >= 12 &&
+        bytes[0] == 0x52 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x46 && // RIFF
+        bytes[8] == 0x57 &&
+        bytes[9] == 0x45 &&
+        bytes[10] == 0x42 &&
+        bytes[11] == 0x50) { // WEBP
+      return MediaType('image', 'webp');
+    }
+
+    // 2. Fallback to file extension
+    final ext = filename.contains('.')
+        ? filename.split('.').last.toLowerCase().trim()
+        : '';
+
+    if (ext == 'png') {
+      return MediaType('image', 'png');
+    }
+    if (ext == 'webp') {
+      return MediaType('image', 'webp');
+    }
+    if (ext == 'jpg' || ext == 'jpeg') {
+      return MediaType('image', 'jpeg');
+    }
+
+    return MediaType('image', 'jpeg');
+  }
+
+  static String ensureValidImageFilename(String filename, MediaType mediaType) {
+    final clean = filename.trim();
+    final ext = clean.contains('.')
+        ? clean.split('.').last.toLowerCase().trim()
+        : '';
+    final defaultExt = mediaType.subtype == 'png'
+        ? 'png'
+        : (mediaType.subtype == 'webp' ? 'webp' : 'jpg');
+
+    if (ext == 'jpg' || ext == 'jpeg' || ext == 'png' || ext == 'webp') {
+      return clean;
+    }
+
+    return clean.isEmpty ? 'avatar.$defaultExt' : '$clean.$defaultExt';
+  }
 
   Future<UserModel> getProfile({required String token}) async {
     final url = Uri.parse('${ApiConstants.baseUrl}/auth/me');
@@ -91,6 +155,9 @@ class UserRepo {
   }) async {
     final url = Uri.parse('${ApiConstants.baseUrl}/auth/me/avatar');
 
+    final mediaType = resolveImageMediaType(bytes, filename);
+    final safeFilename = ensureValidImageFilename(filename, mediaType);
+
     final request = http.MultipartRequest('POST', url);
     request.headers['Authorization'] = 'Bearer $token';
 
@@ -98,7 +165,8 @@ class UserRepo {
       http.MultipartFile.fromBytes(
         'file',
         bytes,
-        filename: filename,
+        filename: safeFilename,
+        contentType: mediaType,
       ),
     );
 
