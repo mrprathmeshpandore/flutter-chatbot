@@ -1,3 +1,4 @@
+import collections
 import hashlib
 import json
 import logging
@@ -86,14 +87,49 @@ def sanitize_gemini_error(msg: str) -> str:
 
 
 def extract_retry_delay_seconds(exc: Exception) -> Optional[float]:
-    """Extracts suggested retryDelay in seconds from Gemini API error message or metadata if present."""
-    exc_str = str(exc)
-    match = re.search(r"retryDelay[\'\":\s]+(\d+(?:\.\d+)?)s?", exc_str, re.IGNORECASE)
-    if match:
+    """
+    Extracts suggested retryDelay in seconds from Gemini API error message,
+    HTTP headers (Retry-After), or metadata/details if present.
+    """
+    # 1. Check HTTP response headers if present (e.g. from httpx or google client error)
+    response = getattr(exc, "response", None)
+    if response is not None:
+        headers = getattr(response, "headers", None)
+        if headers:
+            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return float(retry_after)
+                except (ValueError, TypeError):
+                    pass
+
+    # 2. Check exception attributes or protobuf details
+    details = getattr(exc, "details", None)
+    if details:
         try:
-            return float(match.group(1))
-        except (ValueError, TypeError):
+            details_str = str(details)
+            m = re.search(r"retryDelay[\'\":\s]+(\d+(?:\.\d+)?)s?", details_str, re.IGNORECASE)
+            if m:
+                return float(m.group(1))
+        except Exception:
             pass
+
+    # 3. Check error string patterns
+    exc_str = str(exc)
+    patterns = [
+        r"retryDelay[\'\":\s]+(\d+(?:\.\d+)?)s?",
+        r"retry[\s_-]?after[\'\":\s]+(\d+(?:\.\d+)?)s?",
+        r"retry\s+in\s+(\d+(?:\.\d+)?)\s*s?",
+        r"wait\s+(\d+(?:\.\d+)?)\s*s(?:econds)?",
+        r"reset\s+in\s+(\d+(?:\.\d+)?)\s*s?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, exc_str, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1))
+            except (ValueError, TypeError):
+                pass
     return None
 
 
@@ -285,10 +321,89 @@ ai_cache = AIResponseCache(
     ttl_seconds=getattr(settings, "AI_CACHE_TTL_SECONDS", 86400)
 )
 
-# Concurrency limiter to prevent burst RPM spikes
+# Concurrency limiter to prevent burst parallel spikes
 _concurrency_semaphore = threading.Semaphore(
-    getattr(settings, "GEMINI_MAX_CONCURRENT_REQUESTS", 4)
+    getattr(settings, "GEMINI_MAX_CONCURRENT_REQUESTS", 2)
 )
+
+
+class GeminiRateLimiter:
+    """
+    Thread-safe sliding-window rate limiter and request throttler.
+    Ensures outgoing requests to Gemini never exceed GEMINI_MAX_RPM
+    and enforces a minimum spacing between consecutive dispatches.
+    """
+    def __init__(self, max_rpm: Optional[int] = None, min_interval: Optional[float] = None):
+        self._max_rpm = max_rpm
+        self._min_interval = min_interval
+        self._timestamps: collections.deque = collections.deque()
+        self._last_dispatch_time = 0.0
+        self._lock = threading.Lock()
+
+    @property
+    def max_rpm(self) -> int:
+        if self._max_rpm is not None:
+            return self._max_rpm
+        return getattr(settings, "GEMINI_MAX_RPM", 8)
+
+    @property
+    def min_interval(self) -> float:
+        if self._min_interval is not None:
+            return self._min_interval
+        return getattr(settings, "GEMINI_MIN_REQUEST_INTERVAL_SECONDS", 1.0)
+
+    def acquire(self, operation: str = "ai_request", timeout: float = 20.0):
+        """
+        Blocks until a request slot is available within rate limits, or raises
+        AIServiceRateLimitError if waiting would exceed timeout.
+        """
+        start_wait = time.time()
+        while True:
+            now = time.time()
+            with self._lock:
+                cutoff = now - 60.0
+                while self._timestamps and self._timestamps[0] < cutoff:
+                    self._timestamps.popleft()
+
+                time_since_last = now - self._last_dispatch_time
+                spacing_wait = max(0.0, self.min_interval - time_since_last)
+
+                if len(self._timestamps) < self.max_rpm and spacing_wait <= 0.0:
+                    self._timestamps.append(now)
+                    self._last_dispatch_time = now
+                    return
+
+                if len(self._timestamps) >= self.max_rpm:
+                    rpm_wait = max(0.0, 60.0 - (now - self._timestamps[0]) + 0.1)
+                else:
+                    rpm_wait = 0.0
+
+                wait_time = max(spacing_wait, rpm_wait)
+
+            if (now - start_wait) + wait_time > timeout:
+                logger.warning(
+                    f"[RateLimiter] Throttling timeout exceeded ({timeout:.1f}s) for '{operation}'. RPM window full ({len(self._timestamps)}/{self.max_rpm})."
+                )
+                raise AIServiceRateLimitError(
+                    message="The AI service rate limit has been reached. Please try again in a few moments.",
+                    status_code=429,
+                    is_daily_exhaustion=False,
+                )
+
+            logger.info(
+                f"[RateLimiter] Throttling '{operation}': waiting {wait_time:.2f}s to respect {self.max_rpm} RPM limit."
+            )
+            time.sleep(min(wait_time, 2.0))
+
+    def reset(self):
+        """Resets rate limiter state (used in unit tests)."""
+        with self._lock:
+            self._timestamps.clear()
+            self._last_dispatch_time = 0.0
+
+
+# Global rate limiter instance
+gemini_rate_limiter = GeminiRateLimiter()
 
 
 # ==============================================================================
@@ -401,6 +516,7 @@ class AIService:
         initial_delay: float,
         max_delay: float,
         backoff_factor: float,
+        operation_name: str = "generate_text",
     ) -> Tuple[Optional[str], Optional[Exception], int, str]:
         """
         Attempts to generate content with a specific model, applying bounded retries
@@ -412,6 +528,9 @@ class AIService:
         last_reason = "UNAVAILABLE"
 
         for attempt in range(max_retries + 1):
+            logger.info(
+                f"[AI Request Start] purpose='{operation_name}' model='{model_name}' attempt={attempt + 1}/{max_retries + 1}"
+            )
             try:
                 try:
                     from google.genai import types
@@ -428,6 +547,9 @@ class AIService:
                         model=model_name,
                         contents=full_prompt,
                     )
+                logger.info(
+                    f"[AI Request Success] purpose='{operation_name}' model='{model_name}' attempt={attempt + 1} status=200"
+                )
                 return response.text or "", None, 200, "OK"
             except Exception as exc:
                 last_error = exc
@@ -439,18 +561,29 @@ class AIService:
                 # Immediately stop retries if daily quota is exhausted or error is non-transient
                 if reason == "DAILY_QUOTA_EXHAUSTED":
                     logger.warning(
-                        f"Daily AI quota exhausted on model '{model_name}': {safe_err}. Halting retries immediately."
+                        f"[AI Quota Exceeded] Daily AI quota exhausted on model '{model_name}': {safe_err}. Halting retries immediately."
                     )
                     return None, last_error, last_status_code, last_reason
 
                 if not is_transient:
                     logger.error(
-                        f"Non-transient Gemini API error ({reason}, code={status_code}) on model '{model_name}': {safe_err}"
+                        f"[AI Request Fatal Error] Non-transient Gemini API error ({reason}, code={status_code}) on model '{model_name}': {safe_err}"
                     )
                     return None, last_error, last_status_code, last_reason
 
+                logger.warning(
+                    f"[AI Request Transient Error] purpose='{operation_name}' model='{model_name}' error_category='{reason}' "
+                    f"status_code={status_code} attempt={attempt + 1}/{max_retries + 1} error='{safe_err}'"
+                )
+
                 if attempt < max_retries:
                     suggested_delay = extract_retry_delay_seconds(exc)
+                    if status_code == 429 and suggested_delay is not None and suggested_delay > 10.0:
+                        logger.warning(
+                            f"[AI Rate Limit] Suggested delay ({suggested_delay}s) exceeds threshold. Halting retries on '{model_name}'."
+                        )
+                        return None, last_error, last_status_code, last_reason
+
                     if suggested_delay is not None and 0.1 <= suggested_delay <= max_delay:
                         delay = suggested_delay
                     else:
@@ -458,14 +591,13 @@ class AIService:
                         jitter = random.uniform(0.0, base_delay * 0.5)
                         delay = (base_delay * 0.5) + jitter
 
-                    logger.warning(
-                        f"Gemini API transient error ({reason}, code={status_code}) on model '{model_name}': {safe_err}. "
-                        f"Retrying attempt {attempt + 1}/{max_retries} in {delay:.2f}s..."
+                    logger.info(
+                        f"[AI Request Retry] Retrying attempt {attempt + 2}/{max_retries + 1} on model '{model_name}' in {delay:.2f}s..."
                     )
                     time.sleep(delay)
                 else:
                     logger.error(
-                        f"Gemini API retries exhausted ({max_retries} retries) on model '{model_name}'. "
+                        f"[AI Request Exhausted] Gemini API retries exhausted ({max_retries} retries) on model '{model_name}'. "
                         f"Final error ({reason}, code={status_code}): {safe_err}"
                     )
 
@@ -478,9 +610,10 @@ class AIService:
         system_instruction: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
         operation_name: str = "generate_text",
+        **kwargs,
     ) -> str:
         """
-        Sends a generation request to the Gemini API with concurrency throttling,
+        Sends a generation request to the Gemini API with rate throttling, concurrency control,
         bounded retry for transient errors, and automatic model fallback.
         """
         if not settings.GEMINI_API_KEY:
@@ -503,7 +636,7 @@ class AIService:
         effective_timeout = timeout_seconds if timeout_seconds is not None else getattr(settings, "GEMINI_TIMEOUT_SECONDS", 12.0)
         timeout_ms = int(max(0.1, effective_timeout) * 1000)
 
-        max_retries = max(0, getattr(settings, "GEMINI_MAX_RETRIES", 2))
+        max_retries = max(0, getattr(settings, "GEMINI_MAX_RETRIES", 1))
         initial_delay = max(0.001, getattr(settings, "GEMINI_INITIAL_RETRY_DELAY", 1.0))
         max_delay = max(initial_delay, getattr(settings, "GEMINI_MAX_RETRY_DELAY", 4.0))
         backoff_factor = 2.0
@@ -512,6 +645,9 @@ class AIService:
         fallback_model = getattr(settings, "GEMINI_FALLBACK_MODEL", None)
 
         start_time = time.perf_counter()
+
+        # Enforce sliding-window rate throttling before making the API call
+        gemini_rate_limiter.acquire(operation=operation_name)
 
         with _concurrency_semaphore:
             # 1. Attempt primary model
@@ -524,6 +660,7 @@ class AIService:
                 initial_delay=initial_delay,
                 max_delay=max_delay,
                 backoff_factor=backoff_factor,
+                operation_name=operation_name,
             )
 
             if result_text is not None:
@@ -531,10 +668,11 @@ class AIService:
                 log_ai_telemetry(operation=operation_name, model=primary_model, latency_ms=latency_ms, status_code=200)
                 return result_text
 
-            # 2. Attempt fallback model if configured, distinct, and failure is potentially model-specific
-            if fallback_model and fallback_model != primary_model and status_code in (404, 429, 500, 502, 503, 504):
+            # 2. Attempt fallback model only for model-specific errors (500, 502, 503, 504, 404).
+            # Never fallback on 429 rate limit or quota exhaustion (project-level limit).
+            if fallback_model and fallback_model != primary_model and status_code in (404, 500, 502, 503, 504):
                 logger.info(
-                    f"Primary model '{primary_model}' failed ({reason}, code={status_code}). "
+                    f"[AI Fallback] Primary model '{primary_model}' failed ({reason}, code={status_code}). "
                     f"Attempting fallback to '{fallback_model}'..."
                 )
                 fb_text, fb_error, fb_code, fb_reason = cls._invoke_generate_single_model(
@@ -542,10 +680,11 @@ class AIService:
                     model_name=fallback_model,
                     full_prompt=full_prompt,
                     timeout_ms=timeout_ms,
-                    max_retries=1,
+                    max_retries=0,
                     initial_delay=initial_delay,
                     max_delay=max_delay,
                     backoff_factor=backoff_factor,
+                    operation_name=f"{operation_name}_fallback",
                 )
                 if fb_text is not None:
                     latency_ms = (time.perf_counter() - start_time) * 1000
@@ -558,7 +697,6 @@ class AIService:
                     )
                     return fb_text
 
-                # If fallback also failed, use its error details if more informative
                 last_error = fb_error or last_error
                 status_code = fb_code
                 reason = fb_reason
@@ -577,7 +715,7 @@ class AIService:
     ) -> Generator[str, None, None]:
         """
         Sends a streaming generation request to the Gemini API with native streaming,
-        concurrency control, TTFT optimization, and model fallback.
+        rate throttling, concurrency control, and model fallback.
         """
         if not settings.GEMINI_API_KEY:
             raise AIServiceConfigurationError(
@@ -610,7 +748,13 @@ class AIService:
         response_stream = None
         active_model = primary_model
 
+        # Enforce rate throttling before opening stream
+        gemini_rate_limiter.acquire(operation=operation_name)
+
         with _concurrency_semaphore:
+            logger.info(
+                f"[AI Request Start] purpose='{operation_name}' model='{primary_model}' stream=True"
+            )
             # 1. Attempt primary stream
             try:
                 from google.genai import types
@@ -625,11 +769,11 @@ class AIService:
             except Exception as exc:
                 is_transient, status_code, reason = is_transient_gemini_error(exc)
                 safe_err = sanitize_gemini_error(str(exc))
-                logger.warning(f"Primary streaming failed ({reason}, code={status_code}) on '{primary_model}': {safe_err}")
+                logger.warning(f"[AI Request Stream Error] purpose='{operation_name}' model='{primary_model}' error_category='{reason}' code={status_code}: {safe_err}")
 
-                # Try fallback model if appropriate
-                if fallback_model and fallback_model != primary_model and status_code in (404, 429, 500, 502, 503, 504):
-                    logger.info(f"Attempting fallback stream with model '{fallback_model}'...")
+                # Try fallback model only for model-specific errors (not on 429)
+                if fallback_model and fallback_model != primary_model and status_code in (404, 500, 502, 503, 504):
+                    logger.info(f"[AI Fallback Stream] Attempting fallback stream with model '{fallback_model}'...")
                     try:
                         from google.genai import types
                         config = types.GenerateContentConfig(
@@ -656,10 +800,16 @@ class AIService:
                     if chunk.text:
                         yield chunk.text
                 latency_ms = (time.perf_counter() - start_time) * 1000
+                logger.info(
+                    f"[AI Request Success] purpose='{operation_name}' model='{active_model}' stream=True latency_ms={latency_ms:.1f} status=200"
+                )
                 log_ai_telemetry(operation=operation_name, model=active_model, latency_ms=latency_ms, status_code=200)
             except Exception as exc:
                 latency_ms = (time.perf_counter() - start_time) * 1000
                 is_transient, status_code, reason = is_transient_gemini_error(exc)
+                logger.error(
+                    f"[AI Request Stream Error] purpose='{operation_name}' model='{active_model}' error_category='{reason}' code={status_code}"
+                )
                 log_ai_telemetry(operation=operation_name, model=active_model, latency_ms=latency_ms, status_code=status_code)
                 cls._raise_mapped_error(status_code, reason, exc)
 

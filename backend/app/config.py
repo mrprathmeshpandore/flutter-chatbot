@@ -21,10 +21,12 @@ class Settings(BaseSettings):
     GEMINI_MODEL: str = "gemini-flash-lite-latest"
     GEMINI_FALLBACK_MODEL: Optional[str] = "gemini-3.5-flash-lite"
     GEMINI_TIMEOUT_SECONDS: float = 12.0
-    GEMINI_MAX_RETRIES: int = 2
+    GEMINI_MAX_RETRIES: int = 1
     GEMINI_INITIAL_RETRY_DELAY: float = 1.0
     GEMINI_MAX_RETRY_DELAY: float = 4.0
-    GEMINI_MAX_CONCURRENT_REQUESTS: int = 4
+    GEMINI_MAX_CONCURRENT_REQUESTS: int = 2
+    GEMINI_MAX_RPM: int = 8
+    GEMINI_MIN_REQUEST_INTERVAL_SECONDS: float = 1.0
 
     # AI Cache Settings
     AI_CACHE_ENABLED: bool = True

@@ -10,7 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
 from app.main import app
-from app.services.ai_service import AIService, ai_cache
+from app.services.ai_service import AIService, ai_cache, gemini_rate_limiter
 from app.services.auth_service import create_access_token
 from app.models import User
 from app.config import settings
@@ -36,11 +36,13 @@ def setup_test_db():
 
 @pytest.fixture(autouse=True)
 def reset_ai_state_for_tests(monkeypatch):
-    """Resets AI cache and fallback model between tests so unit tests are deterministic."""
+    """Resets AI cache, rate limiter, and fallback model between tests so unit tests are deterministic."""
     ai_cache.clear()
+    gemini_rate_limiter.reset()
     monkeypatch.setattr(settings, "GEMINI_FALLBACK_MODEL", None)
     yield
     ai_cache.clear()
+    gemini_rate_limiter.reset()
 
 
 @pytest.fixture

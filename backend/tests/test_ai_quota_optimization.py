@@ -288,3 +288,60 @@ def test_quiz_deduplication_reuses_unattempted_quiz(db_session: Session, test_us
         )
         assert reused_quiz.id == quiz.id
         assert call_count == 0  # Zero Gemini calls!
+
+
+def test_gemini_rate_limiter_throttling():
+    """Verify GeminiRateLimiter enforces RPM limits and sliding window."""
+    from app.services.ai_service import GeminiRateLimiter
+    limiter = GeminiRateLimiter(max_rpm=3, min_interval=0.01)
+
+    # 3 immediate acquires should succeed
+    limiter.acquire("test_op_1", timeout=1.0)
+    limiter.acquire("test_op_2", timeout=1.0)
+    limiter.acquire("test_op_3", timeout=1.0)
+
+    # 4th acquire with 0.05s timeout must raise AIServiceRateLimitError because 3 slots are full
+    with pytest.raises(AIServiceRateLimitError) as exc_info:
+        limiter.acquire("test_op_4", timeout=0.05)
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.is_daily_exhaustion is False
+
+
+@pytest.mark.disable_mock_gemini
+def test_no_model_fallback_on_429():
+    """Verify that a 429 rate limit or quota exhaustion on primary model NEVER triggers fallback model."""
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = Exception("429 RESOURCE_EXHAUSTED: Rate limit exceeded")
+
+    with patch.object(AIService, "get_client", return_value=mock_client), \
+         patch("app.services.ai_service.settings.GEMINI_API_KEY", "mock_key"), \
+         patch("app.services.ai_service.settings.GEMINI_MODEL", "gemini-flash-lite-latest"), \
+         patch("app.services.ai_service.settings.GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite"), \
+         patch("app.services.ai_service.settings.GEMINI_MAX_RETRIES", 0), \
+         patch("app.services.ai_service.gemini_rate_limiter.acquire"):
+        with pytest.raises(AIServiceRateLimitError):
+            AIService.generate_text("Test prompt")
+
+        # Verify only primary model was attempted, NOT the fallback model!
+        assert mock_client.models.generate_content.call_count == 1
+        called_model = mock_client.models.generate_content.call_args[1]["model"]
+        assert called_model == "gemini-flash-lite-latest"
+
+
+def test_extract_retry_delay_from_headers_and_strings():
+    """Verify extraction of retry delay from various API formats and headers."""
+    from app.services.ai_service import extract_retry_delay_seconds
+
+    # 1. String retryDelay
+    assert extract_retry_delay_seconds(Exception("quota exceeded, retryDelay: 4.5s")) == 4.5
+
+    # 2. String retry in X seconds
+    assert extract_retry_delay_seconds(Exception("Rate limit reached. Please retry in 12s")) == 12.0
+
+    # 3. HTTP response Retry-After header
+    class MockResponseWithHeader:
+        headers = {"retry-after": "7"}
+    class MockErrorWithResponse(Exception):
+        response = MockResponseWithHeader()
+
+    assert extract_retry_delay_seconds(MockErrorWithResponse("Too Many Requests")) == 7.0

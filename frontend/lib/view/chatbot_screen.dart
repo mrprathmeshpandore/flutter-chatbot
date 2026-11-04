@@ -306,8 +306,27 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
             }
           } catch (_) {}
         }
+      } else if (streamedResponse.statusCode == 429 ||
+          streamedResponse.statusCode == 401 ||
+          streamedResponse.statusCode == 403 ||
+          streamedResponse.statusCode == 400) {
+        // Direct rate limit or authorization error: do NOT send duplicate request to /ai/ask!
+        String errorMessage = streamedResponse.statusCode == 429
+            ? 'The AI service rate limit has been reached. Please wait a moment and try again.'
+            : 'Request failed with status ${streamedResponse.statusCode}.';
+        try {
+          final body = await streamedResponse.stream.bytesToString();
+          final dynamic decoded = jsonDecode(body);
+          if (decoded is Map<String, dynamic> && decoded['detail'] != null) {
+            errorMessage = decoded['detail'].toString();
+          }
+        } catch (_) {}
+        if (!mounted) return;
+        setState(() {
+          assistantMessage.content = errorMessage;
+        });
       } else {
-        // Fallback to standard /ai/ask endpoint if SSE route returned error
+        // Fallback to standard /ai/ask endpoint ONLY if SSE transport returned error (e.g. 404, 405, 502)
         final fallbackResponse = await http.post(
           Uri.parse('${ApiConstants.baseUrl}/ai/ask'),
           headers: {
